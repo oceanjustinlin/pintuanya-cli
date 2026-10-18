@@ -371,6 +371,9 @@ class CliTest(unittest.TestCase):
 
     def test_business_login_failures_have_exit_code_two(self):
         for payload in ({"success": False, "message": "请先登录"},
+                        {"code": 401, "message": "请先登录"},
+                        {"success": 0, "code": 401, "message": "请先登录"},
+                        {"message": "登录已过期"},
                         {"success": False, "code": 401},
                         {"success": False, "message": "登录已过期"},
                         {"success": False, "message": "Unauthorized"}):
@@ -614,6 +617,18 @@ class CliTest(unittest.TestCase):
         for price in ("0", "12.345", "NaN", "-3"):
             with self.assertRaises(ValueError):
                 app.cents(price)
+
+    def test_price_and_goods_actions_conflict_in_both_orders(self):
+        price = {"action": "price", "goods_uuid": "goods-1", "sku_uuid": "sku-1", "price": "125.00"}
+        for action in ("delete", "publish", "lock", "unlock", "offline"):
+            for reverse in (False, True):
+                with self.subTest(action=action, reverse=reverse):
+                    item = goods()
+                    item["is_offline"] = 0 if action == "offline" else 1
+                    item["sku_list"][0]["is_freeze"] = 1 if action == "unlock" else 0
+                    rows = [price, {"action": action, "goods_uuid": "goods-1"}]
+                    with self.assertRaisesRegex(ValueError, "冲突"):
+                        app.prepare(list(reversed(rows)) if reverse else rows, {"goods-1": item})
 
 
 if __name__ == "__main__":

@@ -96,13 +96,15 @@ class Client:
             fail(f"HTTP {error.code} {path}；请检查登录状态或接口是否变化")
         except urllib.error.URLError as error:
             fail(f"网络请求失败: {error.reason}")
-        if not isinstance(payload, dict) or payload.get("success") is False:
-            if isinstance(payload, dict):
-                message = str(payload.get("message", "")).lower()
-                if str(payload.get("code")) in ("401", "403") or any(word in message for word in (
-                        "未登录", "未登陆", "请先登录", "请登录", "重新登录", "登录失效", "登录过期",
-                        "登录已过期", "登录已失效", "unauthorized", "not logged in", "login expired")):
-                    raise LoginError("登录失效，请重新设置 PINTUANYA_COOKIE")
+        if isinstance(payload, dict):
+            message = str(payload.get("message", "")).lower()
+            login_message = any(word in message for word in (
+                "未登录", "未登陆", "请先登录", "请登录", "重新登录", "登录失效", "登录过期",
+                "登录已过期", "登录已失效", "unauthorized", "not logged in", "login expired"))
+            if (str(payload.get("code")) in ("401", "403")
+                    or (payload.get("success") is not True and login_message)):
+                raise LoginError("登录失效，请重新设置 PINTUANYA_COOKIE")
+        if not isinstance(payload, dict) or payload.get("success") in (False, 0):
             fail(f"接口返回失败 {path}: {payload.get('message', payload) if isinstance(payload, dict) else payload}")
         return payload
 
@@ -233,12 +235,15 @@ def show_table(items):
 def prepare(rows, inventory):
     operations = []
     seen = set()
+    goods_actions, priced_goods = set(), set()
     for row in rows:
         uid, action = row["goods_uuid"], row["action"]
         goods = inventory.get(uid)
         if not goods:
             fail(f"找不到商品 {uid}")
         if action == "price":
+            if uid in goods_actions:
+                fail(f"商品 {uid} 有冲突的操作；分批执行")
             sku_id = row.get("sku_uuid", "")
             if not sku_id:
                 fail(f"改价必须填写 sku_uuid: {uid}")
@@ -253,12 +258,13 @@ def prepare(rows, inventory):
             if key in seen:
                 fail(f"同一 SKU 有重复改价: {uid}/{sku_id}")
             seen.add(key)
+            priced_goods.add(uid)
             operations.append({"action": action, "goods_uuid": uid, "sku_uuid": sku_id,
                                "title": goods.get("title", ""), "before": old, "after": target})
         else:
-            if uid in seen:
+            if uid in goods_actions or uid in priced_goods:
                 fail(f"商品 {uid} 有冲突的操作；分批执行")
-            seen.add(uid)
+            goods_actions.add(uid)
             if action in ("publish", "offline"):
                 before = int(goods.get("is_offline", -1))
                 after = 0 if action == "publish" else 1
