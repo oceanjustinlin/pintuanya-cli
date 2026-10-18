@@ -1,3 +1,25 @@
-backups/
+# Local planning and agent configuration
+/ROADMAP.md
+/AGENTS.md
+/HANDOFF.md
+/private/
+/.agents/
+/.codex/
+
+# Credentials and operational data
+.env
+.env.*
+!.env.example
+/backups/
+/data/
+/exports/
+/plans/
+/*.csv
+/*.json
 *.log.jsonl
+
+# Python and editor artifacts
 __pycache__/
+*.py[cod]
+.venv/
+.DS_Store
