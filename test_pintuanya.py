@@ -1,0 +1,260 @@
+import copy
+import csv
+import importlib.util
+import io
+import json
+from contextlib import redirect_stdout
+import unittest
+import tempfile
+from unittest.mock import patch
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("pintuanya", Path(__file__).with_name("pintuanya.py"))
+app = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(app)
+
+GROUP = "group-1"
+
+
+def goods():
+    return {"goods_uuid": "goods-1", "groupon_uuid": GROUP, "title": "测试黑胶",
+            "category_uuid": "category-1", "cover": "cover.jpg", "image_list": ["cover.jpg"],
+            "unit": "张", "is_offline": 1, "is_must_buy": 0, "is_free_shipping": 0,
+            "sku_list": [{"sku_uuid": "sku-1", "price": 12000, "cost_price": 9000,
+                          "stock": 3, "sku_number": "A", "is_freeze": 0}]}
+
+
+class FakeClient:
+    def __init__(self, item):
+        self.items = {item["goods_uuid"]: copy.deepcopy(item)}
+        self.calls = []
+
+    def inventory(self, group):
+        return copy.deepcopy(self.items)
+
+    def request(self, method, path, *, body=None):
+        self.calls.append((method, path, copy.deepcopy(body)))
+        item = self.items.get(body.get("goods_uuid"))
+        if path.endswith("/batch/price"):
+            for sku in self.items["goods-1"]["sku_list"]:
+                if sku["sku_uuid"] == body["sku_list"][0]["sku_uuid"]:
+                    sku["price"] = body["sku_list"][0]["price"]
+        elif path.endswith("/offline"):
+            item["is_offline"] = body["is_offline"]
+        elif path.endswith("/delete"):
+            del self.items[body["goods_uuid"]]
+        else:
+            item = self.items[body["goods_uuid"]]
+            item["sku_list"] = body["sku_list"]
+
+
+def plan(operations):
+    result = {"groupon_uuid": GROUP, "operations": operations}
+    result["sha256"] = app.digest(result)
+    return result
+
+
+class CliTest(unittest.TestCase):
+    def run_read_command(self, arguments, items=None):
+        items = [goods()] if items is None else items
+        class SelectionClient:
+            def __init__(self, cookie):
+                pass
+            def groups(self):
+                return [{"groupon_uuid": GROUP, "title": "黑胶"}]
+            def inventory(self, group, query=""):
+                self_test.assertEqual(group, GROUP)
+                queries.append(query)
+                return {item["goods_uuid"]: copy.deepcopy(item) for item in items
+                        if query in item["title"]}
+        self_test, queries = self, []
+        output = io.StringIO()
+        with patch.object(app, "Client", SelectionClient), redirect_stdout(output):
+            app.main(["--group", GROUP] + arguments)
+        return output.getvalue(), queries
+
+    def test_list_filters_status_without_changing_raw_json(self):
+        offline = goods()
+        online = copy.deepcopy(offline)
+        online.update(goods_uuid="online", is_offline=0)
+        frozen = copy.deepcopy(online)
+        frozen["goods_uuid"] = "frozen"
+        frozen["sku_list"].append(dict(frozen["sku_list"][0], sku_uuid="sku-2", is_freeze=1))
+        items = [offline, online, frozen]
+        for status, expected in (("all", items), ("online", [online, frozen]),
+                                 ("offline", [offline]), ("frozen", [frozen])):
+            with self.subTest(status=status):
+                output, _ = self.run_read_command(["list", "--status", status, "--format", "json"], items)
+                self.assertEqual(json.loads(output), expected)
+
+    def test_list_defaults_to_readable_table_and_all_statuses(self):
+        output, queries = self.run_read_command(["list"])
+        self.assertIn("goods_uuid", output)
+        self.assertIn("goods-1", output)
+        self.assertIn("测试黑胶", output)
+        self.assertIn("下架", output)
+        self.assertEqual(queries, [""])
+
+    def test_list_query_and_empty_json(self):
+        output, queries = self.run_read_command(["list", "--query", "不存在", "--format", "json"])
+        self.assertEqual(json.loads(output), [])
+        self.assertEqual(queries, ["不存在"])
+
+    def test_export_and_list_csv_share_columns_and_query(self):
+        item = goods()
+        item["title"] = '测试,黑胶\n"限定"'
+        item["sku_list"].append({"sku_uuid": "sku-2", "price": 100, "is_freeze": 1})
+        item["sku_list"].append({"sku_uuid": "sku-3", "price": 100, "is_freeze": 0,
+                                 "stock": 0, "cost_price": 0, "sku_number": ""})
+        expected_header = ["goods_uuid", "title", "is_offline", "sku_uuid", "sku_title", "price",
+                           "is_freeze", "category_uuid", "stock", "cost_price", "sku_number"]
+        listing, _ = self.run_read_command(["list", "--format", "csv"], [item])
+        rows = list(csv.reader(io.StringIO(listing)))
+        self.assertEqual(rows[0], expected_header)
+        self.assertEqual(rows[1][1], item["title"])
+        self.assertEqual(rows[1][7:], ["category-1", "3", "90.00", "A"])
+        self.assertEqual(rows[2][7:], ["category-1", "", "", ""])
+        self.assertEqual(rows[3][7:], ["category-1", "0", "0.00", ""])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "out.csv"
+            _, queries = self.run_read_command(["export", str(path), "--query", "测试"], [item])
+            self.assertEqual(queries, ["测试"])
+            with path.open(newline="", encoding="utf-8-sig") as handle:
+                self.assertEqual(list(csv.reader(handle)), rows)
+
+    def test_list_csv_empty_inventory_has_header(self):
+        output, _ = self.run_read_command(["list", "--format", "csv"], [])
+        self.assertEqual(len(list(csv.reader(io.StringIO(output)))), 1)
+
+    def test_list_requires_group_before_cookie(self):
+        with patch.dict(app.os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, "选择拼团"):
+                app.main(["list"])
+
+    def test_inventory_sends_title_query_to_backend(self):
+        class ListingClient(app.Client):
+            def __init__(self):
+                self.queries = []
+            def request(self, method, path, *, params=None, body=None):
+                self.queries.append(params["query"])
+                return {"data": {"list": [], "total": 0}}
+        client = ListingClient()
+        client.inventory(GROUP, query="Example Album Deluxe Edition")
+        self.assertEqual(client.queries, ["Example Album Deluxe Edition"] * 2)
+
+    def test_plan_saves_query_for_targeted_apply(self):
+        class SelectionClient:
+            queries = []
+            def __init__(self, cookie):
+                pass
+            def groups(self):
+                return [{"groupon_uuid": GROUP, "title": "黑胶"}]
+            def inventory(self, group, query=""):
+                self.queries.append(query)
+                return {"goods-1": goods()}
+        with tempfile.TemporaryDirectory() as directory:
+            csv_path = Path(directory) / "delete.csv"
+            plan_path = Path(directory) / "plan.json"
+            csv_path.write_text("action,goods_uuid\ndelete,goods-1\n")
+            with patch.object(app, "Client", SelectionClient), patch.dict(app.os.environ, {"PINTUANYA_COOKIE": "test"}):
+                app.main(["--group", GROUP, "plan", "--query", "测试黑胶", str(csv_path), str(plan_path)])
+            self.assertEqual(SelectionClient.queries, ["测试黑胶"])
+            self.assertEqual(__import__("json").loads(plan_path.read_text())["query"], "测试黑胶")
+
+    def test_apply_uses_saved_query_for_every_inventory_read(self):
+        class TargetedClient(FakeClient):
+            def __init__(self, item):
+                super().__init__(item)
+                self.queries = []
+            def inventory(self, group, query=""):
+                self.queries.append(query)
+                return super().inventory(group)
+        client = TargetedClient(goods())
+        document = plan(app.prepare([{"action": "delete", "goods_uuid": "goods-1"}], client.inventory(GROUP)))
+        document["query"] = "测试黑胶"
+        document["sha256"] = app.digest({k: v for k, v in document.items() if k != "sha256"})
+        with patch("builtins.input", return_value="DELETE"):
+            app.apply(client, document, yes=True)
+        self.assertEqual(client.queries[1:], ["测试黑胶", "测试黑胶"])
+
+    def test_client_lists_groups_from_backend(self):
+        class ListingClient(app.Client):
+            def request(self, method, path, *, params=None, body=None):
+                self.called = (method, path, params)
+                return {"data": {"list": [{"groupon_uuid": "a", "title": "黑胶"}], "total": 1}}
+        client = ListingClient("cookie=test")
+        self.assertTrue(hasattr(client, "groups"), "group listing API missing")
+        self.assertEqual(client.groups()[0]["groupon_uuid"], "a")
+        self.assertEqual(client.called[1], "/groupon/batch")
+
+    def test_export_refuses_implicit_group(self):
+        class SelectionClient:
+            def __init__(self, cookie):
+                pass
+            def groups(self):
+                return [{"groupon_uuid": "a", "title": "黑胶"}]
+            def inventory(self, group):
+                return {"goods-1": goods()}
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(app, "Client", SelectionClient), patch.dict(app.os.environ, {}, clear=True):
+                with self.assertRaisesRegex(ValueError, "选择拼团"):
+                    app.main(["export", str(Path(directory) / "out.csv")])
+
+    def test_missing_group_reported_before_missing_cookie(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(app.os.environ, {}, clear=True):
+                with self.assertRaisesRegex(ValueError, "选择拼团"):
+                    app.main(["export", str(Path(directory) / "out.csv")])
+
+    def test_group_selection_requires_explicit_value(self):
+        self.assertTrue(hasattr(app, "resolve_group"), "group selection API missing")
+        with self.assertRaisesRegex(ValueError, "选择拼团"):
+            app.resolve_group(None, "")
+
+    def test_group_name_must_resolve_uniquely(self):
+        self.assertTrue(hasattr(app, "resolve_group"), "group selection API missing")
+        class Groups:
+            def groups(self):
+                return [{"groupon_uuid": "a", "title": "黑胶"},
+                        {"groupon_uuid": "b", "title": "黑胶"}]
+        with self.assertRaisesRegex(ValueError, "重名"):
+            app.resolve_group(Groups(), "黑胶")
+
+    def test_group_uuid_resolves_from_list(self):
+        self.assertTrue(hasattr(app, "resolve_group"), "group selection API missing")
+        class Groups:
+            def groups(self):
+                return [{"groupon_uuid": "a", "title": "黑胶"}]
+        self.assertEqual(app.resolve_group(Groups(), "a"), "a")
+
+    def test_price_uses_integer_cents_and_verifies(self):
+        client = FakeClient(goods())
+        ops = app.prepare([{"action": "price", "goods_uuid": "goods-1",
+                            "sku_uuid": "sku-1", "price": "125.50"}], client.inventory(GROUP))
+        self.assertEqual(ops[0]["after"], 12550)
+        app.apply(client, plan(ops), yes=True)
+        self.assertEqual(client.calls[0][2]["sku_list"], [{"sku_uuid": "sku-1", "price": 12550}])
+
+    def test_changed_state_prevents_all_writes(self):
+        client = FakeClient(goods())
+        ops = app.prepare([{"action": "publish", "goods_uuid": "goods-1"}], client.inventory(GROUP))
+        client.items["goods-1"]["is_offline"] = 0
+        with self.assertRaisesRegex(ValueError, "后台状态已变化"):
+            app.apply(client, plan(ops), yes=True)
+        self.assertEqual(client.calls, [])
+
+    def test_lock_preserves_other_fields(self):
+        item = goods()
+        payload = app.lock_payload(item, 1, GROUP)
+        self.assertEqual(payload["sku_list"][0]["is_freeze"], 1)
+        self.assertEqual(payload["sku_list"][0]["price"], 12000)
+        self.assertEqual(item["sku_list"][0]["is_freeze"], 0)
+
+    def test_bad_price_rejected(self):
+        for price in ("0", "12.345", "NaN", "-3"):
+            with self.assertRaises(ValueError):
+                app.cents(price)
+
+
+if __name__ == "__main__":
+    unittest.main()
