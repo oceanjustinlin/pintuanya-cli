@@ -374,8 +374,8 @@ def read_execution_log(path, plan, resume):
             fail("执行日志顺序异常，停止操作")
         if record["status"] == "done":
             done.add(index)
-    if done and not resume:
-        fail("日志已有已完成项，请使用 apply --resume 续跑")
+    if lines and not resume:
+        fail("日志已有执行记录，请使用 apply --resume 续跑")
     return done
 
 
@@ -385,10 +385,12 @@ def safe_error(error):
     return message.replace(cookie, "[已隐藏]") if cookie else message
 
 
-def append_execution_log(handle, plan, index, op, status, error=""):
+def append_execution_log(handle, plan, index, op, status, error="", *, reconciled=False):
     record = {"plan_sha256": plan["sha256"], "index": index, "action": op["action"],
               "goods_uuid": op["goods_uuid"], "sku_uuid": op.get("sku_uuid", ""),
               "status": status, "error": error, "at": datetime.now(timezone.utc).isoformat()}
+    if reconciled:
+        record["reconciled"] = True
     try:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         handle.flush()
@@ -476,14 +478,28 @@ def apply(client, plan, yes=False, *, plan_path, resume=False):
             fail("已取消删除")
     group, query = plan["groupon_uuid"], plan.get("query", "")
     current = client.inventory(group, query=query) if query else client.inventory(group)
+    first_pending = pending[0][0] if pending else None
+    reconciled = None
     for index, op in enumerate(operations, 1):
         item = current.get(op["goods_uuid"])
         if index in done:
             if not matches_after(item, op):
                 fail(f"已完成项后台状态与 after 不一致，停止续跑: {op['goods_uuid']}")
+        elif resume and index == first_pending and matches_after(item, op):
+            reconciled = (index, op)
         elif not item or snapshot(item, op["action"], op.get("sku_uuid", "")) != op["before"]:
             fail(f"后台状态已变化，未执行任何操作；请人工核对: {op['goods_uuid']}")
-    if not pending:
+    completed_deletes = [op for index, op in enumerate(operations, 1)
+                         if op["action"] == "delete" and (index in done or
+                            (reconciled and index == reconciled[0]))]
+    if query and completed_deletes:
+        full = client.inventory(group)
+        for op in completed_deletes:
+            if op["goods_uuid"] in full:
+                fail(f"删除项后台状态不符，完整列表中仍有商品: {op['goods_uuid']}")
+    if reconciled:
+        pending = pending[1:]
+    if not pending and not reconciled:
         print("全部项目已完成并回查通过")
         return
     backup_deleted(plan, [op for _, op in pending], current)
@@ -491,6 +507,14 @@ def apply(client, plan, yes=False, *, plan_path, resume=False):
         with log_path.open("a", encoding="utf-8") as handle:
             handle.flush()
             os.fsync(handle.fileno())
+            if reconciled:
+                index, op = reconciled
+                append_execution_log(handle, plan, index, op, "done", reconciled=True)
+                done.add(index)
+                print(f"第 {index} 项续跑时确认已生效，记为完成")
+            if not pending:
+                print("全部项目已完成并回查通过")
+                return
             execute_operations(client, plan, pending, current, handle, len(done))
     except OSError:
         fail("执行日志无法打开或持久化，停止操作；请检查权限、磁盘并核对后台状态")
