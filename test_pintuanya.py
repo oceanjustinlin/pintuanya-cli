@@ -55,6 +55,52 @@ def plan(operations):
 
 
 class CliTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.directory = Path(directory.name)
+        backup_patch = patch.object(app, "BACKUP_DIR", self.directory / "backups", create=True)
+        backup_patch.start()
+        self.addCleanup(backup_patch.stop)
+
+    def test_delete_backup_contains_original_goods_before_first_write(self):
+        events = []
+        class OrderedClient(FakeClient):
+            def request(self, method, path, *, body=None):
+                backups = list((self_test.directory / "backups").glob("*.json"))
+                self_test.assertEqual(len(backups), 1)
+                events.append(json.loads(backups[0].read_text(encoding="utf-8")))
+                return super().request(method, path, body=body)
+        self_test = self
+        client = OrderedClient(goods())
+        deleted = goods()
+        deleted["goods_uuid"] = "goods-2"
+        client.items["goods-2"] = deleted
+        document = plan(app.prepare([{"action": "publish", "goods_uuid": "goods-1"},
+                                     {"action": "delete", "goods_uuid": "goods-2"}], client.items))
+        with patch("builtins.input", return_value="DELETE"):
+            app.apply(client, document, yes=True)
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0]["goods"], [deleted])
+        self.assertEqual(events[0]["version"], 1)
+        self.assertEqual(events[0]["groupon_uuid"], GROUP)
+        self.assertEqual(events[0]["plan_sha256"], document["sha256"])
+        self.assertIn("+00:00", events[0]["created_at"])
+
+    def test_no_delete_does_not_create_backup(self):
+        client = FakeClient(goods())
+        document = plan(app.prepare([{"action": "publish", "goods_uuid": "goods-1"}], client.items))
+        app.apply(client, document, yes=True)
+        self.assertFalse((self.directory / "backups").exists())
+
+    def test_backup_failure_prevents_all_writes(self):
+        client = FakeClient(goods())
+        document = plan(app.prepare([{"action": "delete", "goods_uuid": "goods-1"}], client.items))
+        with patch("builtins.input", return_value="DELETE"), patch.object(Path, "open", side_effect=PermissionError("不可写")):
+            with self.assertRaisesRegex(ValueError, "备份"):
+                app.apply(client, document, yes=True)
+        self.assertEqual(client.calls, [])
+
     def test_targeted_verification_request_count_is_independent_of_inventory_size(self):
         class PagedClient(app.Client):
             def __init__(self, count):

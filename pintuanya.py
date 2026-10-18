@@ -17,6 +17,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 BASE = "https://www.pintuanya.com/api/v1"
+BACKUP_DIR = Path(__file__).resolve().parent / "backups"
 ACTIONS = {"publish", "offline", "price", "lock", "unlock", "delete"}
 CSV_COLUMNS = ["goods_uuid", "title", "is_offline", "sku_uuid", "sku_title", "price", "is_freeze",
                "category_uuid", "stock", "cost_price", "sku_number"]
@@ -312,6 +313,27 @@ def show(operations):
         print(f"{index:>3}. {op['action']:<7} {op['goods_uuid']}{suffix}  {op['title']}  {before} → {after}")
 
 
+def backup_deleted(plan, operations, current):
+    ids = list(dict.fromkeys(op["goods_uuid"] for op in operations if op["action"] == "delete"))
+    if not ids:
+        return
+    now = datetime.now(timezone.utc)
+    document = {"version": 1, "groupon_uuid": plan["groupon_uuid"], "created_at": now.isoformat(),
+                "plan_sha256": plan["sha256"], "goods": [current[uid] for uid in ids]}
+    name = f"{plan['groupon_uuid']}-{now.strftime('%Y%m%dT%H%M%S%fZ')}.json"
+    path = BACKUP_DIR / name
+    try:
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        with path.open("x", encoding="utf-8") as handle:
+            json.dump(document, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError:
+        fail("删除前备份写入失败，未执行任何操作；请检查 backups 目录权限和磁盘空间")
+    print(f"删除前备份: {path}")
+
+
 def apply(client, plan, yes=False):
     operations = plan["operations"]
     if not isinstance(operations, list) or not operations or any(op.get("action") not in ACTIONS for op in operations):
@@ -334,6 +356,7 @@ def apply(client, plan, yes=False):
         item = current.get(op["goods_uuid"])
         if not item or snapshot(item, op["action"], op.get("sku_uuid", "")) != op["before"]:
             fail(f"后台状态已变化，未执行任何操作: {op['goods_uuid']}")
+    backup_deleted(plan, operations, current)
     done = 0
     for op in operations:
         uid, action = op["goods_uuid"], op["action"]
