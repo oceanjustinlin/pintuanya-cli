@@ -338,6 +338,11 @@ def apply(client, plan, yes=False):
     for op in operations:
         uid, action = op["goods_uuid"], op["action"]
         try:
+            verify_query = query or op.get("title", "")
+            if action == "delete" and not query and verify_query:
+                matched = client.inventory(group, query=verify_query)
+                if uid not in matched:
+                    verify_query = ""
             if action == "price":
                 client.request("PUT", "/groupon/goods/batch/price", body={"groupon_uuid": group,
                                "sku_list": [{"sku_uuid": op["sku_uuid"], "price": op["after"]}]})
@@ -348,7 +353,7 @@ def apply(client, plan, yes=False):
                 client.request("PUT", "/groupon/goods", body=lock_payload(current[uid], op["after"], group))
             else:
                 client.request("PUT", "/groupon/goods/delete", body={"groupon_uuid": group, "goods_uuid": uid})
-            fresh = client.inventory(group, query=query) if query else client.inventory(group)
+            fresh = client.inventory(group, query=verify_query) if verify_query else client.inventory(group)
             item = fresh.get(uid)
             if action == "delete":
                 valid = item is None
@@ -359,7 +364,10 @@ def apply(client, plan, yes=False):
                     valid = all(v == op["after"] for v in actual.values())
             if not valid:
                 fail(f"写入后回查不一致: {uid}")
-            current = fresh
+            if item is None:
+                current.pop(uid, None)
+            else:
+                current[uid] = item
             done += 1
             print(f"完成 {done}/{len(operations)}: {action} {uid}")
         except Exception as error:

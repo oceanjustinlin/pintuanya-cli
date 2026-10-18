@@ -29,8 +29,8 @@ class FakeClient:
         self.items = {item["goods_uuid"]: copy.deepcopy(item)}
         self.calls = []
 
-    def inventory(self, group):
-        return copy.deepcopy(self.items)
+    def inventory(self, group, query=""):
+        return copy.deepcopy({uid: item for uid, item in self.items.items() if query in item["title"]})
 
     def request(self, method, path, *, body=None):
         self.calls.append((method, path, copy.deepcopy(body)))
@@ -55,6 +55,55 @@ def plan(operations):
 
 
 class CliTest(unittest.TestCase):
+    def test_targeted_verification_request_count_is_independent_of_inventory_size(self):
+        class PagedClient(app.Client):
+            def __init__(self, count):
+                self.items, self.reads, self.calls = {}, [], []
+                for index in range(count):
+                    item = goods()
+                    item.update(goods_uuid=f"goods-{index}", title=f"黑胶 {index:04d}")
+                    self.items[item["goods_uuid"]] = item
+            def request(self, method, path, *, params=None, body=None):
+                if method == "GET":
+                    self.reads.append((len(self.calls), params["query"]))
+                    items = [item for item in self.items.values()
+                             if item["is_offline"] == params["is_offline"] and params["query"] in item["title"]]
+                    start = (params["page"] - 1) * params["size"]
+                    return {"data": {"list": copy.deepcopy(items[start:start + params["size"]]), "total": len(items)}}
+                return FakeClient.request(self, method, path, body=body)
+        counts = []
+        for size in (3, 350):
+            client = PagedClient(size)
+            document = plan(app.prepare([{"action": "lock", "goods_uuid": "goods-0"},
+                                         {"action": "lock", "goods_uuid": "goods-1"}], client.items))
+            app.apply(client, document, yes=True)
+            counts.append(len([read for read in client.reads if read[0] > 0]))
+            self.assertEqual(len(client.calls), 2)
+            self.assertTrue(all(read[1] for read in client.reads if read[0] > 0))
+        self.assertEqual(counts, [4, 4])
+
+    def test_delete_falls_back_to_full_read_when_title_query_misses(self):
+        class MissingTitleClient(FakeClient):
+            def inventory(self, group, query=""):
+                queries.append(query)
+                return {} if query else super().inventory(group)
+        client, queries = MissingTitleClient(goods()), []
+        document = plan(app.prepare([{"action": "delete", "goods_uuid": "goods-1"}], client.items))
+        with patch("builtins.input", return_value="DELETE"):
+            app.apply(client, document, yes=True)
+        self.assertEqual(queries, ["", "测试黑胶", ""])
+
+    def test_delete_fallback_does_not_mistake_query_miss_for_success(self):
+        class NoDeleteClient(FakeClient):
+            def inventory(self, group, query=""):
+                return {} if query else super().inventory(group)
+            def request(self, method, path, *, body=None):
+                self.calls.append((method, path, body))
+        client = NoDeleteClient(goods())
+        document = plan(app.prepare([{"action": "delete", "goods_uuid": "goods-1"}], client.items))
+        with patch("builtins.input", return_value="DELETE"), self.assertRaisesRegex(ValueError, "回查不一致"):
+            app.apply(client, document, yes=True)
+
     def test_check_success_uses_one_small_request(self):
         class CheckClient(app.Client):
             def request(self, method, path, *, params=None, body=None):
