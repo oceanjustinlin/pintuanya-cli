@@ -131,6 +131,29 @@ class CliTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "选择拼团"):
                 app.main(["list"])
 
+    def test_get_outputs_original_json_with_chinese_and_indentation(self):
+        output, queries = self.run_read_command(["get", "goods-1"])
+        self.assertEqual(output, json.dumps(goods(), ensure_ascii=False, indent=2) + "\n")
+        self.assertEqual(queries, [""])
+
+    def test_get_reports_missing_exact_uuid(self):
+        for uid in ("missing", "goods", "goods-10"):
+            with self.subTest(uid=uid):
+                with self.assertRaisesRegex(ValueError, "找不到商品"):
+                    self.run_read_command(["get", uid])
+
+    def test_get_query_limits_inventory_before_uuid_lookup(self):
+        output, queries = self.run_read_command(["get", "goods-1", "--query", "黑胶"])
+        self.assertEqual(json.loads(output), goods())
+        self.assertEqual(queries, ["黑胶"])
+        with self.assertRaisesRegex(ValueError, "找不到商品"):
+            self.run_read_command(["get", "goods-1", "--query", "不存在"])
+
+    def test_get_requires_group_before_cookie(self):
+        with patch.dict(app.os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, "选择拼团"):
+                app.main(["get", "goods-1"])
+
     def test_inventory_sends_title_query_to_backend(self):
         class ListingClient(app.Client):
             def __init__(self):

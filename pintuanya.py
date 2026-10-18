@@ -343,13 +343,16 @@ def apply(client, plan, yes=False):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="拼团呀商品批量管理")
-    parser.add_argument("--group", default=os.getenv("PINTUANYA_GROUP"), help="拼团 UUID 或完整名称；list/export/plan 必填")
+    parser.add_argument("--group", default=os.getenv("PINTUANYA_GROUP"), help="拼团 UUID 或完整名称；list/get/export/plan 必填")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("groups", help="列出可选拼团")
     listing = commands.add_parser("list", help="查询商品列表")
     listing.add_argument("--query", default="", help="仅查询匹配标题的商品")
     listing.add_argument("--status", choices=("online", "offline", "frozen", "all"), default="all")
     listing.add_argument("--format", choices=("table", "json", "csv"), default="table")
+    get = commands.add_parser("get", help="按 UUID 查看商品原始 JSON")
+    get.add_argument("goods_uuid", help="商品 UUID，精确匹配")
+    get.add_argument("--query", default="", help="先按标题缩小查询范围")
     export = commands.add_parser("export", help="导出商品和 SKU CSV")
     export.add_argument("--query", default="", help="仅查询匹配标题的商品")
     export.add_argument("output", type=Path)
@@ -361,16 +364,21 @@ def main(argv=None):
     run.add_argument("plan", type=Path)
     run.add_argument("--yes", action="store_true", help="跳过普通确认；删除仍需二次输入")
     args = parser.parse_args(argv)
-    if args.command in ("list", "export", "plan") and not args.group:
+    if args.command in ("list", "get", "export", "plan") and not args.group:
         fail("请先用 groups 查看并选择拼团；通过 --group 传入 UUID 或完整名称")
     client = Client(os.getenv("PINTUANYA_COOKIE"))
     if args.command == "groups":
         for group in client.groups():
             print(f"{group.get('groupon_uuid', '')}\t{group.get('title', '')}")
-    elif args.command in ("list", "export"):
+    elif args.command in ("list", "get", "export"):
         group = resolve_group(client, args.group)
         inventory = client.inventory(group, query=args.query) if args.query else client.inventory(group)
-        if args.command == "export":
+        if args.command == "get":
+            item = inventory.get(args.goods_uuid)
+            if item is None:
+                fail(f"找不到商品 {args.goods_uuid}")
+            print(json.dumps(item, ensure_ascii=False, indent=2))
+        elif args.command == "export":
             with args.output.open("w", newline="", encoding="utf-8-sig") as handle:
                 write_csv(inventory.values(), handle)
             print(f"已导出 {len(inventory)} 件商品: {args.output}")
