@@ -55,6 +55,50 @@ def plan(operations):
 
 
 class CliTest(unittest.TestCase):
+    def test_check_success_uses_one_small_request(self):
+        class CheckClient(app.Client):
+            def request(self, method, path, *, params=None, body=None):
+                self_test.assertEqual((method, path, params),
+                                      ("GET", "/groupon/batch", {"page": 1, "size": 1}))
+                return {"success": True, "data": {"list": [], "total": 7}}
+        self_test = self
+        output = io.StringIO()
+        with patch.object(app, "Client", CheckClient), patch.dict(app.os.environ, {"PINTUANYA_COOKIE": "test"}), redirect_stdout(output):
+            self.assertEqual(app.cli(["check"]), 0)
+        self.assertIn("登录有效", output.getvalue())
+        self.assertIn("7", output.getvalue())
+
+    def test_http_auth_errors_have_exit_code_two_for_all_commands(self):
+        for command in (["check"], ["groups"]):
+            for code in (401, 403):
+                with self.subTest(command=command, code=code):
+                    error = app.urllib.error.HTTPError("https://example.invalid", code, "denied", {}, None)
+                    with patch.object(app.urllib.request, "urlopen", side_effect=error), patch.dict(app.os.environ, {"PINTUANYA_COOKIE": "test"}), patch("sys.stderr", io.StringIO()):
+                        self.assertEqual(app.cli(command), 2)
+
+    def test_business_login_failures_have_exit_code_two(self):
+        for payload in ({"success": False, "message": "请先登录"},
+                        {"success": False, "code": 401},
+                        {"success": False, "message": "登录已过期"},
+                        {"success": False, "message": "Unauthorized"}):
+            with self.subTest(payload=payload):
+                with patch.object(app.urllib.request, "urlopen", return_value=io.BytesIO(json.dumps(payload).encode())), patch.dict(app.os.environ, {"PINTUANYA_COOKIE": "test"}), patch("sys.stderr", io.StringIO()):
+                    self.assertEqual(app.cli(["check"]), 2)
+
+    def test_parameter_and_ordinary_api_errors_have_exit_code_one(self):
+        with patch("sys.stderr", io.StringIO()):
+            self.assertEqual(app.cli(["unknown"]), 1)
+            payload = {"success": False, "message": "商品不存在"}
+            with patch.object(app.urllib.request, "urlopen", return_value=io.BytesIO(json.dumps(payload).encode())), patch.dict(app.os.environ, {"PINTUANYA_COOKIE": "test"}):
+                self.assertEqual(app.cli(["check"]), 1)
+
+    def test_apply_preserves_auth_error_type(self):
+        client = FakeClient(goods())
+        document = plan(app.prepare([{"action": "publish", "goods_uuid": "goods-1"}], client.inventory(GROUP)))
+        with patch.object(client, "request", side_effect=app.LoginError("登录失效")):
+            with self.assertRaises(app.LoginError):
+                app.apply(client, document, yes=True)
+
     def run_read_command(self, arguments, items=None):
         items = [goods()] if items is None else items
         class SelectionClient:

@@ -26,6 +26,15 @@ def fail(message):
     raise ValueError(message)
 
 
+class LoginError(ValueError):
+    pass
+
+
+class ArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        fail(f"参数错误: {message}")
+
+
 def cents(value):
     try:
         number = Decimal(str(value))
@@ -81,12 +90,28 @@ class Client:
             with urllib.request.urlopen(request, timeout=30) as response:
                 payload = json.load(response)
         except urllib.error.HTTPError as error:
+            if error.code in (401, 403):
+                raise LoginError(f"登录失效（HTTP {error.code}），请重新设置 PINTUANYA_COOKIE") from None
             fail(f"HTTP {error.code} {path}；请检查登录状态或接口是否变化")
         except urllib.error.URLError as error:
             fail(f"网络请求失败: {error.reason}")
         if not isinstance(payload, dict) or payload.get("success") is False:
+            if isinstance(payload, dict):
+                message = str(payload.get("message", "")).lower()
+                if str(payload.get("code")) in ("401", "403") or any(word in message for word in (
+                        "未登录", "未登陆", "请先登录", "请登录", "重新登录", "登录失效", "登录过期",
+                        "登录已过期", "登录已失效", "unauthorized", "not logged in", "login expired")):
+                    raise LoginError("登录失效，请重新设置 PINTUANYA_COOKIE")
             fail(f"接口返回失败 {path}: {payload.get('message', payload) if isinstance(payload, dict) else payload}")
         return payload
+
+    def check(self):
+        response = self.request("GET", "/groupon/batch", params={"page": 1, "size": 1})
+        data = response.get("data") or {}
+        total = data.get("total")
+        if not isinstance(data.get("list"), list) or not isinstance(total, int) or total < 0:
+            fail("拼团列表格式已变化，无法确认登录状态")
+        return total
 
     def groups(self):
         groups = []
@@ -338,14 +363,17 @@ def apply(client, plan, yes=False):
             done += 1
             print(f"完成 {done}/{len(operations)}: {action} {uid}")
         except Exception as error:
+            if isinstance(error, LoginError):
+                raise LoginError(f"已完成 {done}/{len(operations)} 项；登录失效，停止执行") from None
             fail(f"已完成 {done}/{len(operations)} 项；在 {action} {uid} 停止: {error}")
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="拼团呀商品批量管理")
+    parser = ArgumentParser(description="拼团呀商品批量管理")
     parser.add_argument("--group", default=os.getenv("PINTUANYA_GROUP"), help="拼团 UUID 或完整名称；list/get/export/plan 必填")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("groups", help="列出可选拼团")
+    commands.add_parser("check", help="检查登录状态和拼团总数")
     listing = commands.add_parser("list", help="查询商品列表")
     listing.add_argument("--query", default="", help="仅查询匹配标题的商品")
     listing.add_argument("--status", choices=("online", "offline", "frozen", "all"), default="all")
@@ -367,7 +395,9 @@ def main(argv=None):
     if args.command in ("list", "get", "export", "plan") and not args.group:
         fail("请先用 groups 查看并选择拼团；通过 --group 传入 UUID 或完整名称")
     client = Client(os.getenv("PINTUANYA_COOKIE"))
-    if args.command == "groups":
+    if args.command == "check":
+        print(f"登录有效；拼团总数: {client.check()}")
+    elif args.command == "groups":
         for group in client.groups():
             print(f"{group.get('groupon_uuid', '')}\t{group.get('title', '')}")
     elif args.command in ("list", "get", "export"):
@@ -409,9 +439,17 @@ def main(argv=None):
         apply(client, document, args.yes)
 
 
-if __name__ == "__main__":
+def cli(argv=None):
     try:
-        main()
+        main(argv)
+        return 0
+    except LoginError as error:
+        print(f"错误: {error}", file=sys.stderr)
+        return 2
     except (ValueError, KeyboardInterrupt) as error:
         print(f"错误: {error}", file=sys.stderr)
-        sys.exit(1)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(cli())
