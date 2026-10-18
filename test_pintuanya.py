@@ -59,9 +59,13 @@ class CliTest(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.directory = Path(directory.name)
+        self.plan_path = self.directory / "plan.json"
         backup_patch = patch.object(app, "BACKUP_DIR", self.directory / "backups", create=True)
         backup_patch.start()
         self.addCleanup(backup_patch.stop)
+        network_patch = patch.object(app.urllib.request, "urlopen", side_effect=AssertionError("测试禁止访问真实接口"))
+        network_patch.start()
+        self.addCleanup(network_patch.stop)
 
     def test_delete_backup_contains_original_goods_before_first_write(self):
         events = []
@@ -79,7 +83,7 @@ class CliTest(unittest.TestCase):
         document = plan(app.prepare([{"action": "publish", "goods_uuid": "goods-1"},
                                      {"action": "delete", "goods_uuid": "goods-2"}], client.items))
         with patch("builtins.input", return_value="DELETE"):
-            app.apply(client, document, yes=True)
+            app.apply(client, document, yes=True, plan_path=self.plan_path)
         self.assertEqual(len(events), 2)
         self.assertEqual(events[0]["goods"], [deleted])
         self.assertEqual(events[0]["version"], 1)
@@ -87,10 +91,204 @@ class CliTest(unittest.TestCase):
         self.assertEqual(events[0]["plan_sha256"], document["sha256"])
         self.assertIn("+00:00", events[0]["created_at"])
 
+    def resumable_batch(self, actions=("publish", "publish", "publish")):
+        class InterruptedClient(FakeClient):
+            def __init__(self):
+                super().__init__(goods())
+                self.fail_second = True
+                self.attempts = []
+                for index in (2, 3):
+                    item = goods()
+                    item.update(goods_uuid=f"goods-{index}", title=f"黑胶 {index}")
+                    self.items[item["goods_uuid"]] = item
+            def request(self, method, path, *, body=None):
+                self.attempts.append(body["goods_uuid"])
+                if body["goods_uuid"] == "goods-2" and self.fail_second:
+                    raise ValueError("模拟第 2 项失败")
+                return super().request(method, path, body=body)
+        client = InterruptedClient()
+        rows = [{"action": action, "goods_uuid": f"goods-{index}"}
+                for index, action in enumerate(actions, 1)]
+        return client, plan(app.prepare(rows, client.items))
+
+    def read_log(self):
+        return [json.loads(line) for line in Path(str(self.plan_path) + ".log.jsonl").read_text(encoding="utf-8").splitlines()]
+
+    def test_resume_skips_verified_done_and_confirms_remaining_count(self):
+        client, document = self.resumable_batch()
+        with self.assertRaisesRegex(ValueError, "已完成 1/3"):
+            app.apply(client, document, yes=True, plan_path=self.plan_path)
+        records = self.read_log()
+        self.assertEqual([(r["index"], r["status"]) for r in records], [(1, "done"), (2, "failed")])
+        self.assertEqual(set(records[0]), {"plan_sha256", "index", "action", "goods_uuid", "sku_uuid", "status", "error", "at"})
+        client.fail_second = False
+        with patch("builtins.input", return_value="APPLY 2") as confirm:
+            app.apply(client, document, plan_path=self.plan_path, resume=True)
+        self.assertIn("APPLY 2", confirm.call_args.args[0])
+        self.assertEqual(client.attempts, ["goods-1", "goods-2", "goods-2", "goods-3"])
+        self.assertEqual([(r["index"], r["status"]) for r in self.read_log()],
+                         [(1, "done"), (2, "failed"), (2, "done"), (3, "done")])
+
+    def test_repeated_apply_requires_resume_and_changed_plan_is_rejected(self):
+        client, document = self.resumable_batch()
+        with self.assertRaises(ValueError):
+            app.apply(client, document, yes=True, plan_path=self.plan_path)
+        attempts = list(client.attempts)
+        with self.assertRaisesRegex(ValueError, "--resume"):
+            app.apply(client, document, yes=True, plan_path=self.plan_path)
+        document["query"] = "黑胶"
+        document["sha256"] = app.digest({k: v for k, v in document.items() if k != "sha256"})
+        with self.assertRaisesRegex(ValueError, "日志.*计划"):
+            app.apply(client, document, yes=True, plan_path=self.plan_path, resume=True)
+        self.assertEqual(client.attempts, attempts)
+
+    def test_resume_checks_done_after_and_all_remaining_before_before_any_write(self):
+        for changed in ("goods-1", "goods-3"):
+            with self.subTest(changed=changed):
+                self.plan_path = self.directory / f"{changed}.json"
+                client, document = self.resumable_batch()
+                with self.assertRaises(ValueError):
+                    app.apply(client, document, yes=True, plan_path=self.plan_path)
+                client.fail_second = False
+                client.items[changed]["is_offline"] = 1 if changed == "goods-1" else 0
+                attempts = list(client.attempts)
+                with self.assertRaisesRegex(ValueError, "状态"):
+                    app.apply(client, document, yes=True, plan_path=self.plan_path, resume=True)
+                self.assertEqual(client.attempts, attempts)
+
+    def test_resume_rebacks_up_remaining_deletions_and_still_requires_delete(self):
+        client, document = self.resumable_batch(("delete", "delete", "publish"))
+        with patch("builtins.input", return_value="DELETE"), self.assertRaises(ValueError):
+            app.apply(client, document, yes=True, plan_path=self.plan_path)
+        backups = set((self.directory / "backups").glob("*.json"))
+        client.fail_second = False
+        with patch("builtins.input", side_effect=["APPLY 2", "DELETE"]) as confirm:
+            app.apply(client, document, plan_path=self.plan_path, resume=True)
+        self.assertEqual(confirm.call_count, 2)
+        new_backups = set((self.directory / "backups").glob("*.json")) - backups
+        self.assertEqual(len(new_backups), 1)
+        backup = json.loads(new_backups.pop().read_text(encoding="utf-8"))
+        self.assertEqual([item["goods_uuid"] for item in backup["goods"]], ["goods-2"])
+        self.assertNotIn("goods-1", client.items)
+
+    def test_resume_all_done_verifies_state_without_confirmation_or_writes(self):
+        client = FakeClient(goods())
+        document = plan(app.prepare([{"action": "lock", "goods_uuid": "goods-1"}], client.items))
+        app.apply(client, document, yes=True, plan_path=self.plan_path)
+        with patch("builtins.input") as confirm:
+            app.apply(client, document, plan_path=self.plan_path, resume=True)
+        confirm.assert_not_called()
+        self.assertEqual(len(client.calls), 1)
+
+    def test_missing_or_malformed_resume_log_prevents_writes(self):
+        client = FakeClient(goods())
+        document = plan(app.prepare([{"action": "publish", "goods_uuid": "goods-1"}], client.items))
+        with self.assertRaisesRegex(ValueError, "日志"):
+            app.apply(client, document, yes=True, plan_path=self.plan_path, resume=True)
+        log_path = Path(str(self.plan_path) + ".log.jsonl")
+        for raw in ('{"incomplete":', '{}\n', '[]\n'):
+            log_path.write_text(raw, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "日志"):
+                app.apply(client, document, yes=True, plan_path=self.plan_path, resume=True)
+        self.assertEqual(client.calls, [])
+
+    def test_unwritable_log_prevents_writes(self):
+        client = FakeClient(goods())
+        document = plan(app.prepare([{"action": "publish", "goods_uuid": "goods-1"}], client.items))
+        with patch.object(Path, "open", side_effect=PermissionError("不可写")):
+            with self.assertRaisesRegex(ValueError, "日志"):
+                app.apply(client, document, yes=True, plan_path=self.plan_path)
+        self.assertEqual(client.calls, [])
+
+    def test_successful_write_with_failed_verification_is_not_automatically_retried(self):
+        client = FakeClient(goods())
+        document = plan(app.prepare([{"action": "publish", "goods_uuid": "goods-1"}], client.items))
+        original_inventory = client.inventory
+        with patch.object(client, "inventory", side_effect=[original_inventory(GROUP), ValueError("回查网络中断")]):
+            with self.assertRaises(ValueError):
+                app.apply(client, document, yes=True, plan_path=self.plan_path)
+        self.assertEqual(self.read_log()[0]["status"], "failed")
+        with self.assertRaisesRegex(ValueError, "状态"):
+            app.apply(client, document, yes=True, plan_path=self.plan_path, resume=True)
+        self.assertEqual(len(client.calls), 1)
+
+    def test_log_errors_do_not_include_cookie(self):
+        client = FakeClient(goods())
+        document = plan(app.prepare([{"action": "publish", "goods_uuid": "goods-1"}], client.items))
+        with patch.dict(app.os.environ, {"PINTUANYA_COOKIE": "secret-cookie"}), patch.object(client, "request", side_effect=ValueError("请求失败 secret-cookie")):
+            with self.assertRaises(ValueError):
+                app.apply(client, document, yes=True, plan_path=self.plan_path)
+        self.assertNotIn("secret-cookie", json.dumps(self.read_log()))
+
+    def test_incomplete_log_line_is_rejected_even_when_json_is_valid(self):
+        client, document = self.resumable_batch()
+        with self.assertRaises(ValueError):
+            app.apply(client, document, yes=True, plan_path=self.plan_path)
+        log_path = Path(str(self.plan_path) + ".log.jsonl")
+        log_path.write_text(log_path.read_text(encoding="utf-8").rstrip("\n"), encoding="utf-8")
+        attempts = list(client.attempts)
+        with self.assertRaisesRegex(ValueError, "日志"):
+            app.apply(client, document, yes=True, plan_path=self.plan_path, resume=True)
+        self.assertEqual(client.attempts, attempts)
+
+    def test_cli_apply_resume_uses_plan_path_log(self):
+        client, document = self.resumable_batch()
+        self.plan_path.write_text(json.dumps(document), encoding="utf-8")
+        with patch.object(app, "Client", return_value=client), patch("sys.stderr", io.StringIO()):
+            self.assertEqual(app.cli(["apply", str(self.plan_path), "--yes"]), 1)
+            client.fail_second = False
+            self.assertEqual(app.cli(["apply", str(self.plan_path), "--resume", "--yes"]), 0)
+        self.assertEqual(self.read_log()[-1]["index"], 3)
+
+    def test_resume_handles_two_prices_on_one_goods_by_original_index(self):
+        class TwoSkuClient(FakeClient):
+            def request(self, method, path, *, body=None):
+                if body["sku_list"][0]["sku_uuid"] == "sku-2" and self.fail_second:
+                    raise ValueError("SKU 2 失败")
+                return super().request(method, path, body=body)
+        item = goods()
+        item["sku_list"].append(dict(item["sku_list"][0], sku_uuid="sku-2"))
+        client = TwoSkuClient(item)
+        client.fail_second = True
+        rows = [{"action": "price", "goods_uuid": "goods-1", "sku_uuid": sku, "price": "125.00"}
+                for sku in ("sku-1", "sku-2")]
+        document = plan(app.prepare(rows, client.items))
+        with self.assertRaises(ValueError):
+            app.apply(client, document, yes=True, plan_path=self.plan_path)
+        client.fail_second = False
+        app.apply(client, document, yes=True, plan_path=self.plan_path, resume=True)
+        self.assertEqual([call[2]["sku_list"][0]["sku_uuid"] for call in client.calls], ["sku-1", "sku-2"])
+
+    def test_log_persistence_failure_stops_later_operations(self):
+        client, document = self.resumable_batch()
+        client.fail_second = False
+        with patch.object(app.os, "fsync", side_effect=[None, OSError("磁盘满")]):
+            with self.assertRaisesRegex(ValueError, "日志"):
+                app.apply(client, document, yes=True, plan_path=self.plan_path)
+        self.assertEqual(client.attempts, ["goods-1"])
+
+    def test_log_metadata_or_order_tampering_prevents_writes(self):
+        client, document = self.resumable_batch()
+        with self.assertRaises(ValueError):
+            app.apply(client, document, yes=True, plan_path=self.plan_path)
+        records = self.read_log()
+        attempts = list(client.attempts)
+        log_path = Path(str(self.plan_path) + ".log.jsonl")
+        for field, value in (("index", 0), ("index", True), ("index", 3),
+                             ("goods_uuid", "wrong"), ("sku_uuid", "wrong"),
+                             ("action", "delete"), ("status", "unknown")):
+            with self.subTest(field=field, value=value):
+                changed = copy.deepcopy(records)
+                changed[0][field] = value
+                log_path.write_text("".join(json.dumps(record) + "\n" for record in changed), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "日志"):
+                    app.apply(client, document, yes=True, plan_path=self.plan_path, resume=True)
+                self.assertEqual(client.attempts, attempts)
+
     def test_no_delete_does_not_create_backup(self):
         client = FakeClient(goods())
         document = plan(app.prepare([{"action": "publish", "goods_uuid": "goods-1"}], client.items))
-        app.apply(client, document, yes=True)
+        app.apply(client, document, yes=True, plan_path=self.plan_path)
         self.assertFalse((self.directory / "backups").exists())
 
     def test_backup_failure_prevents_all_writes(self):
@@ -98,7 +296,7 @@ class CliTest(unittest.TestCase):
         document = plan(app.prepare([{"action": "delete", "goods_uuid": "goods-1"}], client.items))
         with patch("builtins.input", return_value="DELETE"), patch.object(Path, "open", side_effect=PermissionError("不可写")):
             with self.assertRaisesRegex(ValueError, "备份"):
-                app.apply(client, document, yes=True)
+                app.apply(client, document, yes=True, plan_path=self.plan_path)
         self.assertEqual(client.calls, [])
 
     def test_targeted_verification_request_count_is_independent_of_inventory_size(self):
@@ -122,7 +320,7 @@ class CliTest(unittest.TestCase):
             client = PagedClient(size)
             document = plan(app.prepare([{"action": "lock", "goods_uuid": "goods-0"},
                                          {"action": "lock", "goods_uuid": "goods-1"}], client.items))
-            app.apply(client, document, yes=True)
+            app.apply(client, document, yes=True, plan_path=self.directory / f"{size}.json")
             counts.append(len([read for read in client.reads if read[0] > 0]))
             self.assertEqual(len(client.calls), 2)
             self.assertTrue(all(read[1] for read in client.reads if read[0] > 0))
@@ -136,7 +334,7 @@ class CliTest(unittest.TestCase):
         client, queries = MissingTitleClient(goods()), []
         document = plan(app.prepare([{"action": "delete", "goods_uuid": "goods-1"}], client.items))
         with patch("builtins.input", return_value="DELETE"):
-            app.apply(client, document, yes=True)
+            app.apply(client, document, yes=True, plan_path=self.plan_path)
         self.assertEqual(queries, ["", "测试黑胶", ""])
 
     def test_delete_fallback_does_not_mistake_query_miss_for_success(self):
@@ -148,7 +346,7 @@ class CliTest(unittest.TestCase):
         client = NoDeleteClient(goods())
         document = plan(app.prepare([{"action": "delete", "goods_uuid": "goods-1"}], client.items))
         with patch("builtins.input", return_value="DELETE"), self.assertRaisesRegex(ValueError, "回查不一致"):
-            app.apply(client, document, yes=True)
+            app.apply(client, document, yes=True, plan_path=self.plan_path)
 
     def test_check_success_uses_one_small_request(self):
         class CheckClient(app.Client):
@@ -192,7 +390,7 @@ class CliTest(unittest.TestCase):
         document = plan(app.prepare([{"action": "publish", "goods_uuid": "goods-1"}], client.inventory(GROUP)))
         with patch.object(client, "request", side_effect=app.LoginError("登录失效")):
             with self.assertRaises(app.LoginError):
-                app.apply(client, document, yes=True)
+                app.apply(client, document, yes=True, plan_path=self.plan_path)
 
     def run_read_command(self, arguments, items=None):
         items = [goods()] if items is None else items
@@ -336,7 +534,7 @@ class CliTest(unittest.TestCase):
         document["query"] = "测试黑胶"
         document["sha256"] = app.digest({k: v for k, v in document.items() if k != "sha256"})
         with patch("builtins.input", return_value="DELETE"):
-            app.apply(client, document, yes=True)
+            app.apply(client, document, yes=True, plan_path=self.plan_path)
         self.assertEqual(client.queries[1:], ["测试黑胶", "测试黑胶"])
 
     def test_client_lists_groups_from_backend(self):
@@ -394,7 +592,7 @@ class CliTest(unittest.TestCase):
         ops = app.prepare([{"action": "price", "goods_uuid": "goods-1",
                             "sku_uuid": "sku-1", "price": "125.50"}], client.inventory(GROUP))
         self.assertEqual(ops[0]["after"], 12550)
-        app.apply(client, plan(ops), yes=True)
+        app.apply(client, plan(ops), yes=True, plan_path=self.plan_path)
         self.assertEqual(client.calls[0][2]["sku_list"], [{"sku_uuid": "sku-1", "price": 12550}])
 
     def test_changed_state_prevents_all_writes(self):
@@ -402,7 +600,7 @@ class CliTest(unittest.TestCase):
         ops = app.prepare([{"action": "publish", "goods_uuid": "goods-1"}], client.inventory(GROUP))
         client.items["goods-1"]["is_offline"] = 0
         with self.assertRaisesRegex(ValueError, "后台状态已变化"):
-            app.apply(client, plan(ops), yes=True)
+            app.apply(client, plan(ops), yes=True, plan_path=self.plan_path)
         self.assertEqual(client.calls, [])
 
     def test_lock_preserves_other_fields(self):

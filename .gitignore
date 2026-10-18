@@ -1,2 +1,3 @@
 backups/
+*.log.jsonl
 __pycache__/

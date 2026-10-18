@@ -334,31 +334,92 @@ def backup_deleted(plan, operations, current):
     print(f"删除前备份: {path}")
 
 
-def apply(client, plan, yes=False):
-    operations = plan["operations"]
-    if not isinstance(operations, list) or not operations or any(op.get("action") not in ACTIONS for op in operations):
-        fail("计划操作列表无效")
-    if digest({k: v for k, v in plan.items() if k != "sha256"}) != plan.get("sha256"):
-        fail("计划文件校验失败")
-    print(f"拼团: {plan['groupon_uuid']}；共 {len(operations)} 项")
-    show(operations)
-    if not yes:
-        expected = f"APPLY {len(operations)}"
-        if input(f"输入 {expected} 执行: ").strip() != expected:
-            fail("已取消")
-    if any(op["action"] == "delete" for op in operations):
-        if input("包含永久删除。输入 DELETE 确认: ").strip() != "DELETE":
-            fail("已取消删除")
-    group = plan["groupon_uuid"]
-    query = plan.get("query", "")
-    current = client.inventory(group, query=query) if query else client.inventory(group)
-    for op in operations:
-        item = current.get(op["goods_uuid"])
-        if not item or snapshot(item, op["action"], op.get("sku_uuid", "")) != op["before"]:
-            fail(f"后台状态已变化，未执行任何操作: {op['goods_uuid']}")
-    backup_deleted(plan, operations, current)
-    done = 0
-    for op in operations:
+def read_execution_log(path, plan, resume):
+    if not path.exists():
+        if resume:
+            fail("续跑日志不存在，无法确认已完成项")
+        return set()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        fail("执行日志读取失败，停止操作")
+    if raw and not raw.endswith("\n"):
+        fail("执行日志末行不完整，停止操作；请先人工核对后台状态")
+    lines = raw.splitlines()
+    done = set()
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            fail("执行日志损坏，停止操作；请先人工核对后台状态")
+        if not isinstance(record, dict) or record.get("plan_sha256") != plan["sha256"]:
+            fail("执行日志与计划不一致，停止操作")
+        index = record.get("index")
+        if type(index) is not int or not 1 <= index <= len(plan["operations"]):
+            fail("执行日志序号无效，停止操作")
+        op = plan["operations"][index - 1]
+        if (record.get("action") != op["action"] or record.get("goods_uuid") != op["goods_uuid"]
+                or record.get("sku_uuid") != op.get("sku_uuid", "")
+                or record.get("status") not in ("done", "failed")
+                or not isinstance(record.get("error"), str)
+                or not isinstance(record.get("at"), str) or not record["at"]):
+            fail("执行日志记录与计划不一致或格式无效")
+        if index != len(done) + 1:
+            fail("执行日志顺序异常，停止操作")
+        if record["status"] == "done":
+            done.add(index)
+    if done and not resume:
+        fail("日志已有已完成项，请使用 apply --resume 续跑")
+    return done
+
+
+def safe_error(error):
+    message = str(error) or "用户中断"
+    cookie = os.getenv("PINTUANYA_COOKIE")
+    return message.replace(cookie, "[已隐藏]") if cookie else message
+
+
+def append_execution_log(handle, plan, index, op, status, error=""):
+    record = {"plan_sha256": plan["sha256"], "index": index, "action": op["action"],
+              "goods_uuid": op["goods_uuid"], "sku_uuid": op.get("sku_uuid", ""),
+              "status": status, "error": error, "at": datetime.now(timezone.utc).isoformat()}
+    try:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    except OSError:
+        fail("执行日志写入失败；停止后续操作，请人工核对本项后台状态")
+
+
+def matches_after(item, op):
+    if op["action"] == "delete":
+        return item is None
+    if item is None:
+        return False
+    actual = snapshot(item, op["action"], op.get("sku_uuid", ""))
+    if op["action"] in ("lock", "unlock"):
+        return actual == {uid: op["after"] for uid in op["before"]}
+    return actual == op["after"]
+
+
+def write_operation(client, group, op, current):
+    uid, action = op["goods_uuid"], op["action"]
+    if action == "price":
+        client.request("PUT", "/groupon/goods/batch/price", body={"groupon_uuid": group,
+                       "sku_list": [{"sku_uuid": op["sku_uuid"], "price": op["after"]}]})
+    elif action in ("publish", "offline"):
+        client.request("PUT", "/groupon/goods/offline", body={"groupon_uuid": group,
+                       "goods_uuid": uid, "is_offline": op["after"]})
+    elif action in ("lock", "unlock"):
+        client.request("PUT", "/groupon/goods", body=lock_payload(current[uid], op["after"], group))
+    else:
+        client.request("PUT", "/groupon/goods/delete", body={"groupon_uuid": group, "goods_uuid": uid})
+
+
+def execute_operations(client, plan, pending, current, handle, done):
+    group, query = plan["groupon_uuid"], plan.get("query", "")
+    total = len(plan["operations"])
+    for index, op in pending:
         uid, action = op["goods_uuid"], op["action"]
         try:
             verify_query = query or op.get("title", "")
@@ -366,37 +427,67 @@ def apply(client, plan, yes=False):
                 matched = client.inventory(group, query=verify_query)
                 if uid not in matched:
                     verify_query = ""
-            if action == "price":
-                client.request("PUT", "/groupon/goods/batch/price", body={"groupon_uuid": group,
-                               "sku_list": [{"sku_uuid": op["sku_uuid"], "price": op["after"]}]})
-            elif action in ("publish", "offline"):
-                client.request("PUT", "/groupon/goods/offline", body={"groupon_uuid": group,
-                               "goods_uuid": uid, "is_offline": op["after"]})
-            elif action in ("lock", "unlock"):
-                client.request("PUT", "/groupon/goods", body=lock_payload(current[uid], op["after"], group))
-            else:
-                client.request("PUT", "/groupon/goods/delete", body={"groupon_uuid": group, "goods_uuid": uid})
+            write_operation(client, group, op, current)
             fresh = client.inventory(group, query=verify_query) if verify_query else client.inventory(group)
             item = fresh.get(uid)
-            if action == "delete":
-                valid = item is None
-            else:
-                actual = snapshot(item, action, op.get("sku_uuid", "")) if item else None
-                valid = actual == op["after"]
-                if action in ("lock", "unlock") and item:
-                    valid = all(v == op["after"] for v in actual.values())
-            if not valid:
+            if not matches_after(item, op):
                 fail(f"写入后回查不一致: {uid}")
             if item is None:
                 current.pop(uid, None)
             else:
                 current[uid] = item
-            done += 1
-            print(f"完成 {done}/{len(operations)}: {action} {uid}")
-        except Exception as error:
-            if isinstance(error, LoginError):
-                raise LoginError(f"已完成 {done}/{len(operations)} 项；登录失效，停止执行") from None
-            fail(f"已完成 {done}/{len(operations)} 项；在 {action} {uid} 停止: {error}")
+        except (Exception, KeyboardInterrupt) as error:
+            message = safe_error(error)
+            try:
+                append_execution_log(handle, plan, index, op, "failed", message)
+            except ValueError as log_error:
+                message += f"；{log_error}"
+            error_type = LoginError if isinstance(error, LoginError) else ValueError
+            raise error_type(f"已完成 {done}/{total} 项；在 {action} {uid} 停止: {message}") from None
+        append_execution_log(handle, plan, index, op, "done")
+        done += 1
+        print(f"完成 {done}/{total}: {action} {uid}")
+
+
+def apply(client, plan, yes=False, *, plan_path, resume=False):
+    operations = plan["operations"]
+    if (not isinstance(operations, list) or not operations
+            or any(not isinstance(op, dict) or op.get("action") not in ACTIONS for op in operations)):
+        fail("计划操作列表无效")
+    if digest({k: v for k, v in plan.items() if k != "sha256"}) != plan.get("sha256"):
+        fail("计划文件校验失败")
+    log_path = Path(str(plan_path) + ".log.jsonl")
+    done = read_execution_log(log_path, plan, resume)
+    pending = [(index, op) for index, op in enumerate(operations, 1) if index not in done]
+    print(f"拼团: {plan['groupon_uuid']}；共 {len(operations)} 项；剩余 {len(pending)} 项")
+    show([op for _, op in pending])
+    if pending and not yes:
+        expected = f"APPLY {len(pending)}"
+        if input(f"输入 {expected} 执行: ").strip() != expected:
+            fail("已取消")
+    if any(op["action"] == "delete" for _, op in pending):
+        if input("包含永久删除。输入 DELETE 确认: ").strip() != "DELETE":
+            fail("已取消删除")
+    group, query = plan["groupon_uuid"], plan.get("query", "")
+    current = client.inventory(group, query=query) if query else client.inventory(group)
+    for index, op in enumerate(operations, 1):
+        item = current.get(op["goods_uuid"])
+        if index in done:
+            if not matches_after(item, op):
+                fail(f"已完成项后台状态与 after 不一致，停止续跑: {op['goods_uuid']}")
+        elif not item or snapshot(item, op["action"], op.get("sku_uuid", "")) != op["before"]:
+            fail(f"后台状态已变化，未执行任何操作；请人工核对: {op['goods_uuid']}")
+    if not pending:
+        print("全部项目已完成并回查通过")
+        return
+    backup_deleted(plan, [op for _, op in pending], current)
+    try:
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.flush()
+            os.fsync(handle.fileno())
+            execute_operations(client, plan, pending, current, handle, len(done))
+    except OSError:
+        fail("执行日志无法打开或持久化，停止操作；请检查权限、磁盘并核对后台状态")
 
 
 def main(argv=None):
@@ -422,6 +513,7 @@ def main(argv=None):
     run = commands.add_parser("apply", help="执行已保存计划")
     run.add_argument("plan", type=Path)
     run.add_argument("--yes", action="store_true", help="跳过普通确认；删除仍需二次输入")
+    run.add_argument("--resume", action="store_true", help="校验执行日志和已完成项后续跑")
     args = parser.parse_args(argv)
     if args.command in ("list", "get", "export", "plan") and not args.group:
         fail("请先用 groups 查看并选择拼团；通过 --group 传入 UUID 或完整名称")
@@ -467,7 +559,7 @@ def main(argv=None):
         document = json.loads(args.plan.read_text(encoding="utf-8"))
         if args.group and document.get("groupon_uuid") != resolve_group(client, args.group):
             fail("计划中的拼团 UUID 与 --group 不一致")
-        apply(client, document, args.yes)
+        apply(client, document, args.yes, plan_path=args.plan, resume=args.resume)
 
 
 def cli(argv=None):
@@ -477,7 +569,7 @@ def cli(argv=None):
     except LoginError as error:
         print(f"错误: {error}", file=sys.stderr)
         return 2
-    except (ValueError, KeyboardInterrupt) as error:
+    except (ValueError, OSError, KeyboardInterrupt) as error:
         print(f"错误: {error}", file=sys.stderr)
         return 1
 
