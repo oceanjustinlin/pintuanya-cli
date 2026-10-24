@@ -4,6 +4,8 @@
 
 需要 Python 3.9 或更高版本，仅使用标准库，无须安装依赖。本项目使用拼团呀网页使用的内部接口；接口可能随网页更新而变化，项目与拼团呀官方无关联。
 
+新增目录操作：`categories` 查询分类、`upload-image` 上传图片、`catalog-plan` / `catalog-apply` 创建单 SKU 商品、修改分类和置顶/置底。完整输入格式、执行记录和功能目录见 [商品目录功能与命令](docs/catalog.md)。
+
 ## 快速开始
 
 ```bash
@@ -30,7 +32,16 @@ export PINTUANYA_DEVICE_ID
 python3 pintuanya.py check
 ```
 
-`PINTUANYA_COOKIE` 必填；建议同时设置 `PINTUANYA_DEVICE_ID`，未设置时程序会生成随机值。Cookie 只从环境变量读取，不要将它粘贴到命令参数、Issue、CSV 或 Git 文件中。登录失效后，重新从浏览器获取。
+登录优先读取 `PINTUANYA_COOKIE`；macOS 未设置该变量时自动读取本机钥匙串。建议同时设置 `PINTUANYA_DEVICE_ID`，未设置时程序会生成随机值。不要将 Cookie 粘贴到命令参数、Issue、CSV 或 Git 文件中。登录失效后重新获取并更新。
+
+macOS 可复制 Cookie 文本后一次性保存（需要本机 Swift 工具链）：
+
+```bash
+python3 pintuanya.py auth-save --clipboard
+python3 pintuanya.py check
+```
+
+凭据写入系统钥匙串，不写明文文件；后续操作不再依赖剪贴板。
 
 ### 选择拼团
 
@@ -127,6 +138,10 @@ python3 pintuanya.py apply plan.json --resume --yes
 | `0` | 命令成功 |
 | `1` | 参数、校验、文件或普通接口错误 |
 | `2` | 登录失效，例如 HTTP 401/403 或明确的业务登录失败 |
+
+## 操作复盘
+
+[2026-10-23 商品上架流程复盘](docs/lessons/2026-10-23-listing.md) 记录 CLI 能力判断、商品与规格区分、钥匙串登录、剪贴板诊断和接口验证的经验及当前限制。
 
 ## 开发与贡献
 

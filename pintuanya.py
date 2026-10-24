@@ -88,8 +88,16 @@ class Client:
             "X-Timestamp": str(int(time.time())),
         })
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                payload = json.load(response)
+            transport = os.getenv("PINTUANYA_TRANSPORT", "urllib")
+            if transport == "curl":
+                from http_transport import api_request
+                payload = api_request(url, method, dict(request.header_items()), body,
+                                      os.getenv("PINTUANYA_RESOLVE_IP"))
+            elif transport == "urllib":
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    payload = json.load(response)
+            else:
+                fail("PINTUANYA_TRANSPORT 仅支持 urllib 或 curl")
         except urllib.error.HTTPError as error:
             if error.code in (401, 403):
                 raise LoginError(f"登录失效（HTTP {error.code}），请重新设置 PINTUANYA_COOKIE") from None
@@ -104,9 +112,40 @@ class Client:
             if (str(payload.get("code")) in ("401", "403")
                     or (payload.get("success") is not True and login_message)):
                 raise LoginError("登录失效，请重新设置 PINTUANYA_COOKIE")
-        if not isinstance(payload, dict) or payload.get("success") in (False, 0):
+        if (not isinstance(payload, dict) or payload.get("success") in (False, 0)
+                or str(payload.get("code", 0)) not in ("0", "200", "None")):
             fail(f"接口返回失败 {path}: {payload.get('message', payload) if isinstance(payload, dict) else payload}")
         return payload
+
+    def categories(self, group):
+        data = self.request("GET", "/groupon/category/batch", params={"groupon_uuid": group}).get("data")
+        if not isinstance(data, list):
+            fail("分类列表格式已变化")
+        return data
+
+    def category_goods(self, group, category):
+        """按分类分页，避开后台标题搜索漏掉新商品的问题。"""
+        result = []
+        for offline in (0, 1):
+            collected = 0
+            for page in range(1, 1001):
+                data = self.request("GET", "/groupon/goods/batch", params={
+                    "groupon_uuid": group, "category_uuid": category, "page": page,
+                    "size": 1000, "is_offline": offline}).get("data") or {}
+                batch = data.get("list")
+                total = data.get("total")
+                if not isinstance(batch, list) or type(total) is not int or total < 0:
+                    fail("商品列表格式已变化")
+                if not batch and collected < total:
+                    fail("商品分页提前结束，停止操作")
+                result.extend(batch)
+                collected += len(batch)
+                if collected >= total:
+                    break
+                time.sleep(1)
+            else:
+                fail("商品分页异常")
+        return result
 
     def check(self):
         response = self.request("GET", "/groupon/batch", params={"page": 1, "size": 1})
@@ -526,6 +565,17 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("groups", help="列出可选拼团")
     commands.add_parser("check", help="检查登录状态和拼团总数")
+    auth_save = commands.add_parser("auth-save", help="将 Cookie 安全保存至本机 macOS 钥匙串")
+    auth_save.add_argument("--clipboard", action="store_true", help="读取系统剪贴板文本；默认从标准输入读取")
+    commands.add_parser("categories", help="列出商品分类")
+    upload = commands.add_parser("upload-image", help="上传本地 PNG/JPEG/WebP 商品图片并等待审核")
+    upload.add_argument("image", type=Path)
+    catalog_plan = commands.add_parser("catalog-plan", help="从 JSON 生成创建/分类/置顶计划")
+    catalog_plan.add_argument("input", type=Path)
+    catalog_plan.add_argument("output", type=Path)
+    catalog_apply = commands.add_parser("catalog-apply", help="执行目录计划，支持中断后重新运行核对")
+    catalog_apply.add_argument("plan", type=Path)
+    catalog_apply.add_argument("--yes", action="store_true")
     listing = commands.add_parser("list", help="查询商品列表")
     listing.add_argument("--query", default="", help="仅查询匹配标题的商品")
     listing.add_argument("--status", choices=("online", "offline", "frozen", "all"), default="all")
@@ -545,10 +595,50 @@ def main(argv=None):
     run.add_argument("--yes", action="store_true", help="跳过普通确认；删除仍需二次输入")
     run.add_argument("--resume", action="store_true", help="校验执行日志和已完成项后续跑")
     args = parser.parse_args(argv)
-    if args.command in ("list", "get", "export", "plan") and not args.group:
+    if args.command == "auth-save":
+        import auth
+        if args.clipboard:
+            import subprocess
+            result = subprocess.run(["/usr/bin/pbpaste"], capture_output=True, text=True, check=False)
+            if result.returncode:
+                fail("读取系统剪贴板失败；请检查进程的剪贴板访问权限")
+            cookie = result.stdout
+        else:
+            cookie = sys.stdin.read()
+        auth.save_cookie(cookie)
+        print("Cookie 已保存到本机钥匙串，并通过回读校验")
+        return
+    if args.command in ("list", "get", "export", "plan", "categories", "catalog-plan") and not args.group:
         fail("请先用 groups 查看并选择拼团；通过 --group 传入 UUID 或完整名称")
-    client = Client(os.getenv("PINTUANYA_COOKIE"))
-    if args.command == "check":
+    cookie = os.getenv("PINTUANYA_COOKIE")
+    if not cookie:
+        import auth
+        cookie = auth.load_cookie()
+    client = Client(cookie)
+    if args.command == "upload-image":
+        import catalog
+        print(catalog.upload_image(client, args.image))
+    elif args.command in ("categories", "catalog-plan", "catalog-apply"):
+        import catalog
+        if args.command == "catalog-apply":
+            document = json.loads(args.plan.read_text(encoding="utf-8"))
+            if args.group and resolve_group(client, args.group) != document.get("groupon_uuid"):
+                fail("计划拼团与 --group 不一致")
+            catalog.run(client, document, args.plan, args.yes)
+        else:
+            group = resolve_group(client, args.group)
+            if args.command == "categories":
+                print(json.dumps(client.categories(group), ensure_ascii=False, indent=2))
+            else:
+                specs = json.loads(args.input.read_text(encoding="utf-8"))
+                if not isinstance(specs, list):
+                    fail("目录输入必须是 JSON 数组")
+                document = {"version": 1, "kind": "catalog", "groupon_uuid": group,
+                            "operations": catalog.prepare(client, group, specs)}
+                document["sha256"] = digest(document)
+                args.output.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
+                print(json.dumps(document, ensure_ascii=False, indent=2))
+    elif args.command == "check":
         print(f"登录有效；拼团总数: {client.check()}")
     elif args.command == "groups":
         for group in client.groups():

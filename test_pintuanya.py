@@ -66,6 +66,9 @@ class CliTest(unittest.TestCase):
         network_patch = patch.object(app.urllib.request, "urlopen", side_effect=AssertionError("测试禁止访问真实接口"))
         network_patch.start()
         self.addCleanup(network_patch.stop)
+        keychain_patch = patch("auth.load_cookie", return_value=None)
+        keychain_patch.start()
+        self.addCleanup(keychain_patch.stop)
 
     def test_delete_backup_contains_original_goods_before_first_write(self):
         events = []
