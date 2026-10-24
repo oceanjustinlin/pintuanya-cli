@@ -6,6 +6,8 @@
 
 新增目录操作：`categories` 查询分类、`upload-image` 上传图片、`catalog-plan` / `catalog-apply` 创建单 SKU 商品、修改分类和置顶/置底。完整输入格式、执行记录和功能目录见 [商品目录功能与命令](docs/catalog.md)。
 
+黑胶商品的默认图片、命名、规格、库存、NEW 分组及双位置顶要求，见 [上架约束与验收](docs/listing-workflow.md)。执行规则和程序已强制的校验范围在文档中分别说明。
+
 ## 快速开始
 
 ```bash

@@ -568,9 +568,12 @@ def main(argv=None):
     auth_save = commands.add_parser("auth-save", help="将 Cookie 安全保存至本机 macOS 钥匙串")
     auth_save.add_argument("--clipboard", action="store_true", help="读取系统剪贴板文本；默认从标准输入读取")
     commands.add_parser("categories", help="列出商品分类")
+    catalog_list = commands.add_parser("catalog-list", help="按后台原顺序回查全拼团或指定分类的上架商品")
+    catalog_list.add_argument("--category", default="", help="分类 UUID；省略表示全拼团")
+    catalog_list.add_argument("--limit", type=int, default=10, help="完整分页核对后输出前 N 件，默认10")
     upload = commands.add_parser("upload-image", help="上传本地 PNG/JPEG/WebP 商品图片并等待审核")
     upload.add_argument("image", type=Path)
-    catalog_plan = commands.add_parser("catalog-plan", help="从 JSON 生成创建/分类/置顶计划")
+    catalog_plan = commands.add_parser("catalog-plan", help="从 JSON 生成创建/追加规格/分类/置顶计划")
     catalog_plan.add_argument("input", type=Path)
     catalog_plan.add_argument("output", type=Path)
     catalog_apply = commands.add_parser("catalog-apply", help="执行目录计划，支持中断后重新运行核对")
@@ -608,8 +611,10 @@ def main(argv=None):
         auth.save_cookie(cookie)
         print("Cookie 已保存到本机钥匙串，并通过回读校验")
         return
-    if args.command in ("list", "get", "export", "plan", "categories", "catalog-plan") and not args.group:
+    if args.command in ("list", "get", "export", "plan", "categories", "catalog-plan", "catalog-list") and not args.group:
         fail("请先用 groups 查看并选择拼团；通过 --group 传入 UUID 或完整名称")
+    if args.command == "catalog-list" and args.limit <= 0:
+        fail("--limit 必须大于零")
     cookie = os.getenv("PINTUANYA_COOKIE")
     if not cookie:
         import auth
@@ -618,7 +623,7 @@ def main(argv=None):
     if args.command == "upload-image":
         import catalog
         print(catalog.upload_image(client, args.image))
-    elif args.command in ("categories", "catalog-plan", "catalog-apply"):
+    elif args.command in ("categories", "catalog-plan", "catalog-apply", "catalog-list"):
         import catalog
         if args.command == "catalog-apply":
             document = json.loads(args.plan.read_text(encoding="utf-8"))
@@ -629,6 +634,9 @@ def main(argv=None):
             group = resolve_group(client, args.group)
             if args.command == "categories":
                 print(json.dumps(client.categories(group), ensure_ascii=False, indent=2))
+            elif args.command == "catalog-list":
+                items = filter_goods(client.category_goods(group, args.category), "online")
+                print(json.dumps(items[:args.limit], ensure_ascii=False, indent=2))
             else:
                 specs = json.loads(args.input.read_text(encoding="utf-8"))
                 if not isinstance(specs, list):

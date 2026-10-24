@@ -63,6 +63,9 @@ def matches(item, body):
 
 def execute(client, group, op, state, save):
     action = op['action']
+    if action == 'append-variants':
+        import append_variants
+        return append_variants.execute(client, group, op, state, save)
     if action == 'create':
         body = op['body']
         items = client.category_goods(group, body['category_uuid'])
@@ -72,7 +75,10 @@ def execute(client, group, op, state, save):
                 raise ValueError('创建结果不确定或已变化；停止且不重复创建，请人工核对')
             state.update(status='done', goods_uuid=same[0]['goods_uuid']); save(); return
         if same:
-            raise ValueError('同名商品已存在；停止创建')
+            raise ValueError('同名商品已存在；核对原规格并追加规格，相同规格不重复添加，停止创建')
+        if op.get('identity_check'):
+            from listing_identity import catalog_goods, reject_existing_work
+            reject_existing_work(body['title'], catalog_goods(client, group))
         state['status'] = 'sending'; save()
         client.request('POST', '/groupon/goods', body=body)
         items = client.category_goods(group, body['category_uuid'])
@@ -126,24 +132,36 @@ def execute(client, group, op, state, save):
 
 
 def prepare(client, group, specs):
-    categories = {c['category_uuid'] for c in client.categories(group)}
+    from listing_identity import candidate_kind, catalog_goods, reject_existing_work
+    categories = list(dict.fromkeys(c['category_uuid'] for c in client.categories(group)))
     operations = []
     seen_titles, seen_ids = set(), set()
+    existing = None
     for spec in specs:
         if not isinstance(spec, dict):
             raise ValueError('目录操作必须是 JSON 对象')
         action = spec.get('action','create')
         if action == 'create':
+            title = spec.get('title', '')
+            parts = title.split(' - ', 1) if isinstance(title, str) else []
+            if len(parts) != 2 or not all(part.strip() for part in parts):
+                raise ValueError('上架标题必须为 Artist - Title，可追加括号发行日期')
+            if not spec.get('variants'):
+                raise ValueError('上架必须使用非空 variants；单个版本也需显式规格')
             body = create_body(group,spec)
             if body['category_uuid'] not in categories or body['title'] in seen_titles:
                 raise ValueError('分类不存在或创建标题重复')
+            if any(candidate_kind(body['title'], title) for title in seen_titles):
+                raise ValueError('计划中同一作品应合并为一个商品的 variants，不能重复创建')
             seen_titles.add(body['title'])
-            if any(g['title'] == body['title'] for g in client.category_goods(group,body['category_uuid'])):
-                raise ValueError('同名商品已存在')
-            operations.append({'action':action,'body':body})
-        elif action in ('category','sort'):
-            required = ('goods_uuid', 'source_category_uuid',
-                        'category_uuid' if action == 'category' else 'direction')
+            if existing is None:
+                existing = catalog_goods(client, group)
+            reject_existing_work(body['title'], existing)
+            operations.append({'action':action,'body':body,'identity_check':True})
+        elif action in ('category','sort','append-variants'):
+            required = ('goods_uuid', 'source_category_uuid')
+            if action != 'append-variants':
+                required += ('category_uuid' if action == 'category' else 'direction',)
             if any(not spec.get(key) for key in required):
                 raise ValueError('分类/排序缺少必要字段')
             uid = spec['goods_uuid']
@@ -154,7 +172,10 @@ def prepare(client, group, specs):
             before = next((g for g in items if g['goods_uuid'] == uid),None)
             if not before: raise ValueError('找不到商品')
             op = {'action':action,'goods_uuid':uid,'before':before}
-            if action == 'category':
+            if action == 'append-variants':
+                import append_variants
+                op['body'] = append_variants.build(group, before, spec)
+            elif action == 'category':
                 if spec['category_uuid'] not in categories: raise ValueError('目标分类不存在')
                 op['category_uuid'] = spec['category_uuid']
             else:
