@@ -63,12 +63,12 @@ class CliTest(unittest.TestCase):
         backup_patch = patch.object(app, "BACKUP_DIR", self.directory / "backups", create=True)
         backup_patch.start()
         self.addCleanup(backup_patch.stop)
-        network_patch = patch.object(app.urllib.request, "urlopen", side_effect=AssertionError("测试禁止访问真实接口"))
+        network_patch = patch.object(app, "api_urlopen", side_effect=AssertionError("测试禁止访问真实接口"))
         network_patch.start()
         self.addCleanup(network_patch.stop)
-        keychain_patch = patch("auth.load_cookie", return_value=None)
-        keychain_patch.start()
-        self.addCleanup(keychain_patch.stop)
+        config_patch = patch('auth_config.DEFAULT_ENV', self.directory / 'missing.env')
+        config_patch.start()
+        self.addCleanup(config_patch.stop)
 
     def test_delete_backup_contains_original_goods_before_first_write(self):
         events = []
@@ -525,7 +525,7 @@ class CliTest(unittest.TestCase):
             for code in (401, 403):
                 with self.subTest(command=command, code=code):
                     error = app.urllib.error.HTTPError("https://example.invalid", code, "denied", {}, None)
-                    with patch.object(app.urllib.request, "urlopen", side_effect=error), patch.dict(app.os.environ, {"PINTUANYA_COOKIE": "test"}), patch("sys.stderr", io.StringIO()):
+                    with patch.object(app, "api_urlopen", side_effect=error), patch.dict(app.os.environ, {"PINTUANYA_COOKIE": "test"}), patch("sys.stderr", io.StringIO()):
                         self.assertEqual(app.cli(command), 2)
 
     def test_business_login_failures_have_exit_code_two(self):
@@ -537,14 +537,14 @@ class CliTest(unittest.TestCase):
                         {"success": False, "message": "登录已过期"},
                         {"success": False, "message": "Unauthorized"}):
             with self.subTest(payload=payload):
-                with patch.object(app.urllib.request, "urlopen", return_value=io.BytesIO(json.dumps(payload).encode())), patch.dict(app.os.environ, {"PINTUANYA_COOKIE": "test"}), patch("sys.stderr", io.StringIO()):
+                with patch.object(app, "api_urlopen", return_value=io.BytesIO(json.dumps(payload).encode())), patch.dict(app.os.environ, {"PINTUANYA_COOKIE": "test"}), patch("sys.stderr", io.StringIO()):
                     self.assertEqual(app.cli(["check"]), 2)
 
     def test_parameter_and_ordinary_api_errors_have_exit_code_one(self):
         with patch("sys.stderr", io.StringIO()):
             self.assertEqual(app.cli(["unknown"]), 1)
             payload = {"success": False, "message": "商品不存在"}
-            with patch.object(app.urllib.request, "urlopen", return_value=io.BytesIO(json.dumps(payload).encode())), patch.dict(app.os.environ, {"PINTUANYA_COOKIE": "test"}):
+            with patch.object(app, "api_urlopen", return_value=io.BytesIO(json.dumps(payload).encode())), patch.dict(app.os.environ, {"PINTUANYA_COOKIE": "test"}):
                 self.assertEqual(app.cli(["check"]), 1)
 
     def test_apply_preserves_auth_error_type(self):

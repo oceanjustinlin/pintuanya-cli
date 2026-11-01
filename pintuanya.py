@@ -31,6 +31,11 @@ class LoginError(ValueError):
     pass
 
 
+def api_urlopen(request, timeout=30):
+    from http_transport import NoRedirect
+    return urllib.request.build_opener(NoRedirect()).open(request, timeout=timeout)
+
+
 class ArgumentParser(argparse.ArgumentParser):
     def error(self, message):
         fail(f"参数错误: {message}")
@@ -70,18 +75,32 @@ def resolve_group(client, selector):
 class Client:
     def __init__(self, cookie):
         if not cookie:
-            fail("请先设置 PINTUANYA_COOKIE（从自己的已登录浏览器会话获取）；不要把 Cookie 写入 CSV 或提交到 Git")
+            fail("未配置 PINTUANYA_COOKIE；请运行 auth-login，或通过 auth-save 导入；不要把 Cookie 写入计划或 Git")
         self.cookie = cookie
         self.device_id = os.getenv("PINTUANYA_DEVICE_ID") or str(uuid.uuid4())
+        if any(c in self.cookie + self.device_id for c in '\r\n\x00'):
+            fail('登录凭据包含非法换行或控制字符（内容已隐藏）')
+        self.cookies = None
+        self.persist_cookie = None
+        self.timeout = 30
+
+    def receive_cookies(self, url, headers):
+        if headers is not None and hasattr(headers, 'get_all') and headers.get_all('Set-Cookie'):
+            if self.cookies is None:
+                from login import CookieState
+                self.cookies = CookieState(self.cookie)
+            self.cookies.receive(url, headers)
+            self.cookie = self.cookies.header()
 
     def request(self, method, path, *, params=None, body=None):
         url = BASE + path
         if params:
             url += "?" + urllib.parse.urlencode(params)
         data = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
+        before_cookie = self.cookie
         request = urllib.request.Request(url, data=data, method=method, headers={
             "Accept": "application/json", "Content-Type": "application/json",
-            "Cookie": self.cookie, "Origin": "https://www.pintuanya.com",
+            "Cookie": self.cookies.header(url) if self.cookies is not None else self.cookie, "Origin": "https://www.pintuanya.com",
             "Referer": "https://www.pintuanya.com/groupon/list",
             "User-Agent": "pintuanya-cli/0.1",
             "X-Device-Id": self.device_id, "X-Nonce": str(uuid.uuid4()),
@@ -92,15 +111,17 @@ class Client:
             if transport == "curl":
                 from http_transport import api_request
                 payload = api_request(url, method, dict(request.header_items()), body,
-                                      os.getenv("PINTUANYA_RESOLVE_IP"))
+                                      os.getenv("PINTUANYA_RESOLVE_IP"),
+                                      on_headers=lambda headers: self.receive_cookies(url, headers), timeout=self.timeout)
             elif transport == "urllib":
-                with urllib.request.urlopen(request, timeout=30) as response:
+                with api_urlopen(request, timeout=self.timeout) as response:
+                    self.receive_cookies(url, getattr(response, 'headers', None))
                     payload = json.load(response)
             else:
                 fail("PINTUANYA_TRANSPORT 仅支持 urllib 或 curl")
         except urllib.error.HTTPError as error:
             if error.code in (401, 403):
-                raise LoginError(f"登录失效（HTTP {error.code}），请重新设置 PINTUANYA_COOKIE") from None
+                raise LoginError(f"登录被拒绝（HTTP {error.code}），请用 auth-status 检查或 auth-login 重新登录") from None
             fail(f"HTTP {error.code} {path}；请检查登录状态或接口是否变化")
         except urllib.error.URLError as error:
             fail(f"网络请求失败: {error.reason}")
@@ -111,10 +132,15 @@ class Client:
                 "登录已过期", "登录已失效", "unauthorized", "not logged in", "login expired"))
             if (str(payload.get("code")) in ("401", "403")
                     or (payload.get("success") is not True and login_message)):
-                raise LoginError("登录失效，请重新设置 PINTUANYA_COOKIE")
+                raise LoginError("登录失效，请运行 auth-login；写入请按原计划回查后续跑")
         if (not isinstance(payload, dict) or payload.get("success") in (False, 0)
                 or str(payload.get("code", 0)) not in ("0", "200", "None")):
-            fail(f"接口返回失败 {path}: {payload.get('message', payload) if isinstance(payload, dict) else payload}")
+            fail(f"接口返回失败 {path}（响应内容已隐藏）")
+        if self.cookie != before_cookie and self.persist_cookie:
+            try:
+                self.persist_cookie(self.cookie)
+            except (ValueError, OSError):
+                print('警告: 服务器请求已成功，但新 Cookie 未保存；请检查配置是否被修改，并运行 auth-status。', file=sys.stderr)
         return payload
 
     def categories(self, group):
@@ -421,7 +447,14 @@ def read_execution_log(path, plan, resume):
 def safe_error(error):
     message = str(error) or "用户中断"
     cookie = os.getenv("PINTUANYA_COOKIE")
-    return message.replace(cookie, "[已隐藏]") if cookie else message
+    if cookie:
+        message = message.replace(cookie, "[已隐藏]")
+        for part in cookie.split(';'):
+            key, sep, value = part.strip().partition('=')
+            if sep and value:
+                message = message.replace(value, '[已隐藏]')
+    import re
+    return re.sub(r'([?&](?:code|state|uuid|token)=)[^\s&\"\x27]+', r'\1[已隐藏]', message)
 
 
 def append_execution_log(handle, plan, index, op, status, error="", *, reconciled=False):
@@ -560,12 +593,24 @@ def apply(client, plan, yes=False, *, plan_path, resume=False):
 
 
 def main(argv=None):
-    parser = ArgumentParser(description="拼团呀商品批量管理")
+    import auth_config
+    bootstrap = ArgumentParser(add_help=False)
+    source = bootstrap.add_mutually_exclusive_group()
+    source.add_argument('--env-file', type=Path, default=auth_config.DEFAULT_ENV, help='配置文件，默认脚本目录 .env')
+    source.add_argument('--no-env-file', action='store_true', help='仅使用外部环境变量，不读取或保存配置文件')
+    options, remaining = bootstrap.parse_known_args(argv)
+    config = auth_config.AuthConfig(None if options.no_env_file else options.env_file)
+    config.load()
+    parser = ArgumentParser(description="拼团呀商品批量管理", parents=[bootstrap])
     parser.add_argument("--group", default=os.getenv("PINTUANYA_GROUP"), help="拼团 UUID 或完整名称；list/get/export/plan 必填")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("groups", help="列出可选拼团")
     commands.add_parser("check", help="检查登录状态和拼团总数")
-    auth_save = commands.add_parser("auth-save", help="将 Cookie 安全保存至本机 macOS 钥匙串")
+    commands.add_parser('auth-status', help='查看凭据来源和只读登录检查（不显示凭据）')
+    auth_login = commands.add_parser('auth-login', help='微信扫码登录并验证保存至 .env，不打开浏览器')
+    auth_login.add_argument('--timeout', type=int, default=180, help='登录总超时秒数，默认180，最多600')
+    auth_login.add_argument('--qr-output', type=Path, help='二维码图片输出路径，文件必须不存在；省略则结束时自动清理')
+    auth_save = commands.add_parser("auth-save", help="验证 Cookie 并保存至 .env，不使用钥匙串")
     auth_save.add_argument("--clipboard", action="store_true", help="读取系统剪贴板文本；默认从标准输入读取")
     commands.add_parser("categories", help="列出商品分类")
     catalog_list = commands.add_parser("catalog-list", help="按后台原顺序回查全拼团或指定分类的上架商品")
@@ -597,29 +642,19 @@ def main(argv=None):
     run.add_argument("plan", type=Path)
     run.add_argument("--yes", action="store_true", help="跳过普通确认；删除仍需二次输入")
     run.add_argument("--resume", action="store_true", help="校验执行日志和已完成项后续跑")
-    args = parser.parse_args(argv)
-    if args.command == "auth-save":
+    args = parser.parse_args(remaining)
+    if args.command in ('auth-save', 'auth-status', 'auth-login'):
         import auth
-        if args.clipboard:
-            import subprocess
-            result = subprocess.run(["/usr/bin/pbpaste"], capture_output=True, text=True, check=False)
-            if result.returncode:
-                fail("读取系统剪贴板失败；请检查进程的剪贴板访问权限")
-            cookie = result.stdout
-        else:
-            cookie = sys.stdin.read()
-        auth.save_cookie(cookie)
-        print("Cookie 已保存到本机钥匙串，并通过回读校验")
+        auth.run_command(args, config, Client)
         return
     if args.command in ("list", "get", "export", "plan", "categories", "catalog-plan", "catalog-list") and not args.group:
         fail("请先用 groups 查看并选择拼团；通过 --group 传入 UUID 或完整名称")
     if args.command == "catalog-list" and args.limit <= 0:
         fail("--limit 必须大于零")
     cookie = os.getenv("PINTUANYA_COOKIE")
-    if not cookie:
-        import auth
-        cookie = auth.load_cookie()
     client = Client(cookie)
+    if config.source == '配置文件':
+        client.persist_cookie = lambda updated: config.save(updated, client.device_id)
     if args.command == "upload-image":
         import catalog
         print(catalog.upload_image(client, args.image))
@@ -695,10 +730,10 @@ def cli(argv=None):
         main(argv)
         return 0
     except LoginError as error:
-        print(f"错误: {error}", file=sys.stderr)
+        print(f"错误: {safe_error(error)}", file=sys.stderr)
         return 2
     except (ValueError, OSError, KeyboardInterrupt) as error:
-        print(f"错误: {error}", file=sys.stderr)
+        print(f"错误: {safe_error(error)}", file=sys.stderr)
         return 1
 
 

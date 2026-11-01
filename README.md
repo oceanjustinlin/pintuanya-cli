@@ -18,32 +18,48 @@ python3 pintuanya.py --help
 
 ### 设置登录信息
 
-在自己已登录的拼团呀网页中，打开开发者工具的 Network 面板，从商品列表请求中获取 `Cookie` 和 `X-Device-Id`，然后在当前终端设置环境变量。以下命令适用于 Bash 和 Zsh：
+CLI 默认自动读取脚本目录下 Git 忽略的 `.env`，不需要手动 `source`，不再读取系统钥匙串。Cookie 和 `PINTUANYA_DEVICE_ID` 成对使用；文件存在时，以文件中的这一对凭据为准，终端残留的旧值不会覆盖新登录。其他设置采用终端环境变量优先、文件补缺的规则。
+
+微信扫码登录（无需 F12，不会自动打开浏览器）：
 
 ```bash
-printf 'Cookie: '
-IFS= read -r -s PINTUANYA_COOKIE
-printf '\n'
-export PINTUANYA_COOKIE
+python3 pintuanya.py auth-login
+```
 
-printf 'X-Device-Id: '
-IFS= read -r -s PINTUANYA_DEVICE_ID
-printf '\n'
-export PINTUANYA_DEVICE_ID
+命令打印一个临时二维码 PNG/JPEG 的本地路径。保持命令运行，打开该图片，用微信扫码并确认。CLI 等待确认、完成回调，并通过只读登录检查后，才将 Cookie 和固定设备 ID 保存到 `.env`。默认等待 180 秒，最多 600 秒；Ctrl-C 可取消。临时图片在结束时自动清理。如需指定图片位置：
 
+```bash
+python3 pintuanya.py auth-login --timeout 240 --qr-output /tmp/pintuanya-login.jpg
+```
+
+指定位置必须不存在，文件权限为 0600；显式输出的图片会保留，请在结束后删除。2026-11-01 已完成真实微信扫码、账号回调、凭据保存及独立新进程登录验证。网站或微信协议变化可能导致登录失败；失败不会覆盖旧凭据。
+
+查看配置来源及登录状态（不显示凭据）：
+
+```bash
+python3 pintuanya.py auth-status
 python3 pintuanya.py check
 ```
 
-登录优先读取 `PINTUANYA_COOKIE`；macOS 未设置该变量时自动读取本机钥匙串。建议同时设置 `PINTUANYA_DEVICE_ID`，未设置时程序会生成随机值。不要将 Cookie 粘贴到命令参数、Issue、CSV 或 Git 文件中。登录失效后重新获取并更新。
-
-macOS 可复制 Cookie 文本后一次性保存（需要本机 Swift 工具链）：
+仍可使用旧的 Cookie 导入方式作为备用。`auth-save` 会先验证，再保存到 `.env`；交互输入隐藏，macOS 支持从剪贴板导入：
 
 ```bash
+python3 pintuanya.py auth-save
 python3 pintuanya.py auth-save --clipboard
-python3 pintuanya.py check
 ```
 
-凭据写入系统钥匙串，不写明文文件；后续操作不再依赖剪贴板。
+保存为原子替换，权限 0600，保留其他配置；如果配置同时被其他进程修改，会停止保存。不会读取或删除历史钥匙串条目。不要将 Cookie 粘贴到命令参数、Issue、CSV、计划或 Git 文件中。`.env` 语法支持键值、单引号、JSON 双引号和注释，不执行 shell，也不展开 `$HOME` 等变量。可以参考 [配置示例](.env.example)。
+
+选择其他配置文件，或仅使用外部注入的环境变量：
+
+```bash
+python3 pintuanya.py --env-file /path/to/private.env auth-status
+python3 pintuanya.py --no-env-file check
+```
+
+默认 `.env` 不存在时，也可读取外部环境变量。`--no-env-file` 不读写文件，不支持 `auth-login` / `auth-save` 保存；自动化环境应成对注入 `PINTUANYA_COOKIE` 和 `PINTUANYA_DEVICE_ID`。自定义配置文件应自行确保不被 Git 跟踪。
+
+Cookie 有效期由服务端控制，CLI 不能延长。原站返回 `Set-Cookie` 时，CLI 会合并适用 Cookie；文件凭据模式下会尝试保存更新，外部环境模式仅在本进程更新。未返回新 Cookie 不代表会话会自动续期。若配置保存冲突，会输出警告，不重发已成功的商品写请求。登录被拒绝时退出码为 2；重新登录后按原计划回查，并用已有续跑命令恢复，不要重复新建商品。
 
 ### 选择拼团
 
@@ -143,12 +159,12 @@ python3 pintuanya.py apply plan.json --resume --yes
 
 ## 操作复盘
 
-[2026-10-23 商品上架流程复盘](docs/lessons/2026-10-23-listing.md) 记录 CLI 能力判断、商品与规格区分、钥匙串登录、剪贴板诊断和接口验证的经验及当前限制。
+[2026-10-23 商品上架流程复盘](docs/lessons/2026-10-23-listing.md) 记录 CLI 能力判断、商品与规格区分、历史钥匙串登录、剪贴板诊断和接口验证的经验及当前限制。
 
 ## 开发与贡献
 
 ```bash
-python3 -m unittest test_pintuanya.py
+python3 -m unittest discover
 ```
 
 测试使用模拟客户端，不访问真实接口。欢迎提交 Issue 和 Pull Request。报告问题时请提供 Python 版本、脱敏后的命令与错误信息，不要附上 Cookie、真实商品数据、执行计划或备份。

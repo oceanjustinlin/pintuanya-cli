@@ -20,7 +20,7 @@
 
 ## 登录与图片
 
-继续使用环境变量 `PINTUANYA_COOKIE` 和可选的 `PINTUANYA_DEVICE_ID`。macOS 也支持 `auth-save --clipboard` 保存至钥匙串；环境变量未设置时自动读取。临时脚本和剪贴板不是持久登录配置。不要把凭据写入计划或 Git。
+继续使用环境变量 `PINTUANYA_COOKIE` 和可选的 `PINTUANYA_DEVICE_ID`。CLI 默认自动加载项目 `.env`，其中 Cookie 与设备 ID 优先于外部旧变量，不再读取钥匙串。`auth-login` 微信扫码并校验后保存到 `.env`；`auth-save --clipboard` 可从 macOS 剪贴板导入，验证后保存同一文件。`auth-status` 显示来源并检查登录。仅外部环境模式使用 `--no-env-file`；该模式不保存凭据。详情见 README 的登录章节。不要把凭据写入计划或 Git。
 
 ```bash
 python3 pintuanya.py --group '拼团UUID' categories
@@ -85,7 +85,7 @@ python3 pintuanya.py catalog-apply plans/create.json --yes
 ## 验证
 
 ```bash
-python3 -m unittest test_pintuanya.py test_catalog.py test_http_transport.py test_auth.py
+python3 -m unittest discover
 ```
 
 离线测试不证明线上接口可用。首次线上使用应保留计划和执行记录，并确认后台回查成功。
@@ -104,7 +104,7 @@ export PINTUANYA_TRANSPORT=curl
 export PINTUANYA_RESOLVE_IP='经核实的实际IP'
 ```
 
-只对 `www.pintuanya.com` 生效，保留原域名、SNI 和证书校验；不要把临时 IP 当成长期配置。curl 请求头和 JSON 请求体通过标准输入传递，不将 Cookie 写入命令参数或临时文件。图片存储上传也可使用 curl，不向存储服务发送账号 Cookie。
+只对 `www.pintuanya.com` 生效，保留原域名、SNI 和证书校验；不要把临时 IP 当成长期配置。curl 请求 URL、请求头和 JSON 请求体通过标准输入传递，不将 Cookie 写入命令参数或临时文件。图片存储上传也可使用 curl，不向存储服务发送账号 Cookie。
 
 系统剪贴板读取须检查 `pbpaste` 退出码；受限进程读取失败不能据此认定用户没有复制 Cookie。
 

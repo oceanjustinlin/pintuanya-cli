@@ -39,7 +39,7 @@ class CatalogTest(unittest.TestCase):
         import io,json
         from unittest.mock import patch
         response=io.BytesIO(json.dumps({'code':4020,'msg':'操作频繁'}).encode())
-        with patch('pintuanya.urllib.request.urlopen',return_value=response):
+        with patch('pintuanya.api_urlopen',return_value=response):
             with self.assertRaises(ValueError):pintuanya.Client('cookie=x').request('POST','/groupon/goods',body={})
 
 

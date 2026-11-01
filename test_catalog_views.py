@@ -19,7 +19,7 @@ class CatalogViewsTest(unittest.TestCase):
         output = io.StringIO()
         with patch.object(pintuanya, 'Client', return_value=client), patch.dict(
                 pintuanya.os.environ, {'PINTUANYA_COOKIE': 'test'}), contextlib.redirect_stdout(output):
-            pintuanya.main(['--group', 'g', 'catalog-list', '--limit', '2'])
+            pintuanya.main(['--no-env-file', '--group', 'g', 'catalog-list', '--limit', '2'])
         self.assertEqual([g['goods_uuid'] for g in json.loads(output.getvalue())],
                          ['second-id', 'first-id'])
         client.category_goods.assert_called_once_with('g', '')
@@ -31,7 +31,7 @@ class CatalogViewsTest(unittest.TestCase):
         client.category_goods.return_value = [{'goods_uuid': 'new-first', 'is_offline': 0}]
         with patch.object(pintuanya, 'Client', return_value=client), patch.dict(
                 pintuanya.os.environ, {'PINTUANYA_COOKIE': 'test'}), contextlib.redirect_stdout(io.StringIO()):
-            pintuanya.main(['--group', 'g', 'catalog-list', '--category', 'new'])
+            pintuanya.main(['--no-env-file', '--group', 'g', 'catalog-list', '--category', 'new'])
         client.category_goods.assert_called_once_with('g', 'new')
 
 
