@@ -1,6 +1,6 @@
 # pintuanya-cli
 
-用 Python 批量管理拼团呀商品，支持查询、CSV 导出、上下架、改价、冻结和删除。写入前先生成可预览的计划，执行时核对后台状态，并在每项操作后回查结果。
+用 Python 批量管理拼团呀商品，支持查询、CSV 导出、上下架、改价、冻结和删除；并可只读查询和导出订单，用于对账统计。写入前先生成可预览的计划，执行时核对后台状态，并在每项操作后回查结果。
 
 需要 Python 3.9 或更高版本，仅使用标准库，无须安装依赖。本项目使用拼团呀网页使用的内部接口；接口可能随网页更新而变化，项目与拼团呀官方无关联。
 
@@ -99,6 +99,18 @@ goods_uuid,title,is_offline,sku_uuid,sku_title,price,is_freeze,category_uuid,sto
 ```
 
 CSV 中 `price` 和 `cost_price` 的单位为人民币元；JSON 保留后台原始分值。后台未返回的新增字段留空，零值保留。`export` 文件使用 UTF-8 BOM 编码；`list --format csv` 向标准输出写入 CSV，不附加说明文字。
+
+## 订单查询与导出
+
+只读，不修改订单。默认查询截至今天的近 180 天、未取消的订单，个人信息脱敏：
+
+```bash
+python3 pintuanya.py --group '拼团UUID' orders --from 2026-10-01 --to 2026-10-31
+python3 pintuanya.py --group '拼团UUID' orders --status shipped
+python3 pintuanya.py --group '拼团UUID' orders-export exports/orders-2026-10.csv --from 2026-10-01 --to 2026-10-31 --status any
+```
+
+`--status` 可选 `all`（未取消）、`unpaid`、`paid`、`shipped`、`canceled`、`after-sales`、`any`（含已取消）。`--level item` 每个商品一行，`--pii full` 输出完整收件信息。列说明和接口依据见 [订单查询与导出](docs/orders.md)。
 
 ## 批量修改
 

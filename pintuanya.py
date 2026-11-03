@@ -601,8 +601,8 @@ def main(argv=None):
     options, remaining = bootstrap.parse_known_args(argv)
     config = auth_config.AuthConfig(None if options.no_env_file else options.env_file)
     config.load()
-    parser = ArgumentParser(description="拼团呀商品批量管理", parents=[bootstrap])
-    parser.add_argument("--group", default=os.getenv("PINTUANYA_GROUP"), help="拼团 UUID 或完整名称；list/get/export/plan 必填")
+    parser = ArgumentParser(description="拼团呀商品与订单管理", parents=[bootstrap])
+    parser.add_argument("--group", default=os.getenv("PINTUANYA_GROUP"), help="拼团 UUID 或完整名称；list/get/export/plan/orders 必填")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("groups", help="列出可选拼团")
     commands.add_parser("check", help="检查登录状态和拼团总数")
@@ -642,20 +642,40 @@ def main(argv=None):
     run.add_argument("plan", type=Path)
     run.add_argument("--yes", action="store_true", help="跳过普通确认；删除仍需二次输入")
     run.add_argument("--resume", action="store_true", help="校验执行日志和已完成项后续跑")
+    for name, help_text in (("orders", "只读查询订单（默认近180天、不含已取消，个人信息脱敏）"),
+                            ("orders-export", "导出订单 CSV（默认每单一行、个人信息脱敏）")):
+        sub = commands.add_parser(name, help=help_text)
+        if name == "orders-export":
+            sub.add_argument("output", type=Path)
+            sub.add_argument("--force", action="store_true", help="允许覆盖已存在的文件")
+        sub.add_argument("--from", dest="date_from", help="起始日期 YYYY-MM-DD（北京时间，含当天）；默认为 --to 前179天")
+        sub.add_argument("--to", dest="date_to", help="结束日期 YYYY-MM-DD（含当天）；默认今天")
+        sub.add_argument("--status", choices=("all", "unpaid", "paid", "shipped", "canceled", "after-sales", "any"),
+                         default="all", help="all=全部未取消（网页默认），any=含已取消")
+        sub.add_argument("--query", default="", help="后台搜索：单号、昵称、收件人、商品名等")
+        sub.add_argument("--level", choices=("order", "item"), default="order", help="CSV 每单一行或每个商品一行")
+        sub.add_argument("--pii", choices=("mask", "full"), default="mask", help="收件人姓名/电话/地址是否脱敏，默认 mask")
+        if name == "orders":
+            sub.add_argument("--format", choices=("table", "json", "csv"), default="table")
+            sub.add_argument("--limit", type=int, default=50, help="表格显示前 N 单，默认50")
     args = parser.parse_args(remaining)
     if args.command in ('auth-save', 'auth-status', 'auth-login'):
         import auth
         auth.run_command(args, config, Client)
         return
-    if args.command in ("list", "get", "export", "plan", "categories", "catalog-plan", "catalog-list") and not args.group:
+    if args.command in ("list", "get", "export", "plan", "categories", "catalog-plan", "catalog-list",
+                        "orders", "orders-export") and not args.group:
         fail("请先用 groups 查看并选择拼团；通过 --group 传入 UUID 或完整名称")
-    if args.command == "catalog-list" and args.limit <= 0:
+    if args.command in ("catalog-list", "orders") and getattr(args, "limit", 1) <= 0:
         fail("--limit 必须大于零")
     cookie = os.getenv("PINTUANYA_COOKIE")
     client = Client(cookie)
     if config.source == '配置文件':
         client.persist_cookie = lambda updated: config.save(updated, client.device_id)
-    if args.command == "upload-image":
+    if args.command in ("orders", "orders-export"):
+        import orders
+        orders.run(client, resolve_group(client, args.group), args)
+    elif args.command == "upload-image":
         import catalog
         print(catalog.upload_image(client, args.image))
     elif args.command in ("categories", "catalog-plan", "catalog-apply", "catalog-list"):
