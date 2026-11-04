@@ -658,13 +658,22 @@ def main(argv=None):
         if name == "orders":
             sub.add_argument("--format", choices=("table", "json", "csv"), default="table")
             sub.add_argument("--limit", type=int, default=50, help="表格显示前 N 单，默认50")
+    order_plan = commands.add_parser("order-plan", help="从 CSV 生成订单改状态/加删标记计划")
+    order_plan.add_argument("input", type=Path)
+    order_plan.add_argument("output", type=Path)
+    order_plan.add_argument("--from", dest="date_from", help="查找订单的起始日期 YYYY-MM-DD；默认近180天")
+    order_plan.add_argument("--to", dest="date_to", help="结束日期 YYYY-MM-DD；默认今天")
+    order_apply = commands.add_parser("order-apply", help="执行订单计划，逐单写入并回查")
+    order_apply.add_argument("plan", type=Path)
+    order_apply.add_argument("--yes", action="store_true", help="跳过普通确认；取消订单相关仍需输入 CANCEL")
+    order_apply.add_argument("--resume", action="store_true", help="校验执行日志和已完成项后续跑")
     args = parser.parse_args(remaining)
     if args.command in ('auth-save', 'auth-status', 'auth-login'):
         import auth
         auth.run_command(args, config, Client)
         return
     if args.command in ("list", "get", "export", "plan", "categories", "catalog-plan", "catalog-list",
-                        "orders", "orders-export") and not args.group:
+                        "orders", "orders-export", "order-plan") and not args.group:
         fail("请先用 groups 查看并选择拼团；通过 --group 传入 UUID 或完整名称")
     if args.command in ("catalog-list", "orders") and getattr(args, "limit", 1) <= 0:
         fail("--limit 必须大于零")
@@ -675,6 +684,21 @@ def main(argv=None):
     if args.command in ("orders", "orders-export"):
         import orders
         orders.run(client, resolve_group(client, args.group), args)
+    elif args.command == "order-plan":
+        import order_ops
+        if args.output.exists():
+            fail(f"计划文件已存在，未覆盖: {args.output}")
+        document = order_ops.plan_document(client, resolve_group(client, args.group), args)
+        order_ops.show(document["operations"])
+        with args.output.open("x", encoding="utf-8") as handle:
+            handle.write(json.dumps(document, ensure_ascii=False, indent=2) + "\n")
+        print(f"计划已保存: {args.output}")
+    elif args.command == "order-apply":
+        import order_ops
+        document = json.loads(args.plan.read_text(encoding="utf-8"))
+        if args.group and document.get("groupon_uuid") != resolve_group(client, args.group):
+            fail("计划中的拼团 UUID 与 --group 不一致")
+        order_ops.apply(client, document, args.plan, yes=args.yes, resume=args.resume)
     elif args.command == "upload-image":
         import catalog
         print(catalog.upload_image(client, args.image))
