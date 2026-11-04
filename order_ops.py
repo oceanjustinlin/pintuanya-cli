@@ -35,10 +35,11 @@ def tags(client, order_uuid):
         fail("订单标记格式已变化，停止操作")
     result = []
     for tag in data:
-        if (not isinstance(tag, dict) or tag.get("tag_id") in (None, "")
+        # tag_id 必须保持后台的整数类型；转成字符串提交删除会被后台拒绝（HTTP 400）。
+        if (not isinstance(tag, dict) or type(tag.get("tag_id")) is not int or tag["tag_id"] <= 0
                 or not isinstance(tag.get("name"), str) or tag.get("type") not in TAG_TYPE_TEXT):
             fail("订单标记格式已变化，停止操作")
-        result.append({"tag_id": str(tag["tag_id"]), "name": tag["name"], "type": tag["type"]})
+        result.append({"tag_id": tag["tag_id"], "name": tag["name"], "type": tag["type"]})
     return result
 
 
@@ -220,8 +221,9 @@ def validate_plan(plan):
     from pintuanya import digest
     operations = plan.get("operations")
     if (plan.get("kind") != "orders" or not isinstance(operations, list) or not operations
-            or any(not isinstance(op, dict) or op.get("action") not in ACTIONS for op in operations)):
-        fail("订单计划无效")
+            or any(not isinstance(op, dict) or op.get("action") not in ACTIONS for op in operations)
+            or any(op["action"] == "untag" and type(op.get("tag_id")) is not int for op in operations)):
+        fail("订单计划无效（旧版计划中的标记 ID 类型不正确，请重新生成计划）")
     if digest({k: v for k, v in plan.items() if k != "sha256"}) != plan.get("sha256"):
         fail("计划文件校验失败")
 

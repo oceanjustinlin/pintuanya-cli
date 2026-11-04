@@ -42,7 +42,9 @@ class Backend:
                 self.next_id += 1
                 self.tags.setdefault(uid, []).append({"tag_id": self.next_id, "name": body["tag"], "type": body["type"]})
             elif path == "/order/tag/delete":
-                self.tags[uid] = [t for t in self.tags.get(uid, []) if str(t["tag_id"]) != body["tag_id"]]
+                if type(body["tag_id"]) is not int:
+                    raise ValueError("HTTP 400 /order/tag/delete")  # 与真实后台一致：字符串 ID 被拒绝
+                self.tags[uid] = [t for t in self.tags.get(uid, []) if t["tag_id"] != body["tag_id"]]
         if self.lose_reply:
             message, self.lose_reply = self.lose_reply, None
             raise ValueError(message)
@@ -107,7 +109,7 @@ class PrepareTest(unittest.TestCase):
         ops = order_ops.prepare(backend, rows({"action": "tag", "order": "11", "value": "已对账", "tag_type": "private"},
                                                {"action": "untag", "order": "11", "value": "已对账"}),
                                 list(backend.orders.values()))
-        self.assertEqual((ops[0]["type"], ops[1]["tag_id"]), (2, "7"))
+        self.assertEqual((ops[0]["type"], ops[1]["tag_id"]), (2, 7))
         for row in ({"action": "untag", "order": "11", "value": "不存在"},
                     {"action": "tag", "order": "11", "value": "a\nb"},
                     {"action": "tag", "order": "11", "value": "x", "tag_type": "vip"}):
@@ -215,6 +217,17 @@ class ApplyTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "已完成项"):
             self.run_apply(backend, plan, resume=True)  # 日志称已完成，但后台没有该标记
         self.assertEqual(backend.writes, [])
+
+    def test_rejects_string_tag_ids(self):
+        backend = Backend(orders_fixture(), tags={"u1": [{"tag_id": "7", "name": "x", "type": 1}]})
+        with self.assertRaisesRegex(ValueError, "格式已变化"):
+            order_ops.tags(backend, "u1")
+        backend = Backend(orders_fixture(), tags={"u1": [{"tag_id": 7, "name": "x", "type": 1}]})
+        plan = plan_for(backend, {"action": "untag", "order": "11", "value": "x"})
+        plan["operations"][0]["tag_id"] = "7"
+        plan["sha256"] = digest({k: v for k, v in plan.items() if k != "sha256"})
+        with self.assertRaisesRegex(ValueError, "重新生成计划"):
+            self.run_apply(backend, plan)
 
     def test_tampered_plan_rejected(self):
         backend = Backend(orders_fixture())

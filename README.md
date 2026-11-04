@@ -1,6 +1,6 @@
 # pintuanya-cli
 
-用 Python 批量管理拼团呀商品，支持查询、CSV 导出、上下架、改价、冻结和删除；并可只读查询和导出订单，用于对账统计。写入前先生成可预览的计划，执行时核对后台状态，并在每项操作后回查结果。
+用 Python 批量管理拼团呀商品，支持查询、CSV 导出、上下架、改价、冻结和删除；并可查询、导出订单用于对账统计，以及批量修改订单状态和标记。写入前先生成可预览的计划，执行时核对后台状态，并在每项操作后回查结果。
 
 需要 Python 3.9 或更高版本，仅使用标准库，无须安装依赖。本项目使用拼团呀网页使用的内部接口；接口可能随网页更新而变化，项目与拼团呀官方无关联。
 
@@ -110,7 +110,9 @@ python3 pintuanya.py --group '拼团UUID' orders --status shipped
 python3 pintuanya.py --group '拼团UUID' orders-export exports/orders-2026-10.csv --from 2026-10-01 --to 2026-10-31 --status any
 ```
 
-`--status` 可选 `all`（未取消）、`unpaid`、`paid`、`shipped`、`canceled`、`after-sales`、`any`（含已取消）。`--level item` 每个商品一行，`--pii full` 输出完整收件信息。列说明和接口依据见 [订单查询与导出](docs/orders.md)。
+`--status` 可选 `all`（未取消）、`unpaid`、`paid`、`shipped`、`canceled`、`after-sales`、`any`（含已取消）。`--level item` 每个商品一行，`--pii full` 输出完整收件信息。
+
+修改订单状态、添加或删除订单标记，使用 `order-plan` 生成计划，再用 `order-apply` 执行。执行前核对订单当前状态，每项写入后回查，支持 `--resume` 续跑。CSV 格式、列说明和接口依据见 [订单查询、导出与修改](docs/orders.md)。
 
 ## 批量修改
 
