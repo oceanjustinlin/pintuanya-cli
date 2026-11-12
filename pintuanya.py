@@ -17,6 +17,16 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 BASE = "https://www.pintuanya.com/api/v1"
+RATE_LIMIT_RETRIES = 3
+
+
+def rate_limit_wait(headers, attempt):
+    """Seconds to wait after HTTP 429: honour a numeric Retry-After, else 10/20/40s, capped at 120s."""
+    try:
+        value = int(str(headers.get("Retry-After", "")).strip()) if headers is not None else None
+    except ValueError:
+        value = None
+    return min(120, value if value is not None and value >= 0 else 10 * 2 ** attempt)
 BACKUP_DIR = Path(__file__).resolve().parent / "backups"
 ACTIONS = {"publish", "offline", "price", "lock", "unlock", "delete"}
 CSV_COLUMNS = ["goods_uuid", "title", "is_offline", "sku_uuid", "sku_title", "price", "is_freeze",
@@ -106,25 +116,37 @@ class Client:
             "X-Device-Id": self.device_id, "X-Nonce": str(uuid.uuid4()),
             "X-Timestamp": str(int(time.time())),
         })
-        try:
-            transport = os.getenv("PINTUANYA_TRANSPORT", "urllib")
-            if transport == "curl":
-                from http_transport import api_request
-                payload = api_request(url, method, dict(request.header_items()), body,
-                                      os.getenv("PINTUANYA_RESOLVE_IP"),
-                                      on_headers=lambda headers: self.receive_cookies(url, headers), timeout=self.timeout)
-            elif transport == "urllib":
-                with api_urlopen(request, timeout=self.timeout) as response:
-                    self.receive_cookies(url, getattr(response, 'headers', None))
-                    payload = json.load(response)
-            else:
-                fail("PINTUANYA_TRANSPORT 仅支持 urllib 或 curl")
-        except urllib.error.HTTPError as error:
-            if error.code in (401, 403):
-                raise LoginError(f"登录被拒绝（HTTP {error.code}），请用 auth-status 检查或 auth-login 重新登录") from None
-            fail(f"HTTP {error.code} {path}；请检查登录状态或接口是否变化")
-        except urllib.error.URLError as error:
-            fail(f"网络请求失败: {error.reason}")
+        for attempt in range(RATE_LIMIT_RETRIES + 1):
+            try:
+                transport = os.getenv("PINTUANYA_TRANSPORT", "urllib")
+                if transport == "curl":
+                    from http_transport import api_request
+                    payload = api_request(url, method, dict(request.header_items()), body,
+                                          os.getenv("PINTUANYA_RESOLVE_IP"),
+                                          on_headers=lambda headers: self.receive_cookies(url, headers), timeout=self.timeout)
+                elif transport == "urllib":
+                    with api_urlopen(request, timeout=self.timeout) as response:
+                        self.receive_cookies(url, getattr(response, 'headers', None))
+                        payload = json.load(response)
+                else:
+                    fail("PINTUANYA_TRANSPORT 仅支持 urllib 或 curl")
+                break
+            except urllib.error.HTTPError as error:
+                if error.code in (401, 403):
+                    raise LoginError(f"登录被拒绝（HTTP {error.code}），请用 auth-status 检查或 auth-login 重新登录") from None
+                # 只读请求遇限流按 Retry-After/指数退避重试本请求；写请求结果不确定，绝不自动重发
+                if error.code == 429 and method == "GET" and attempt < RATE_LIMIT_RETRIES:
+                    wait = rate_limit_wait(getattr(error, "headers", None), attempt)
+                    print(f"HTTP 429 {path}，{wait} 秒后重试（{attempt + 1}/{RATE_LIMIT_RETRIES}）", file=sys.stderr)
+                    time.sleep(wait)
+                    request.remove_header("X-nonce"); request.add_header("X-Nonce", str(uuid.uuid4()))
+                    request.remove_header("X-timestamp"); request.add_header("X-Timestamp", str(int(time.time())))
+                    continue
+                if error.code == 429:
+                    fail(f"HTTP 429 {path}：接口限流；{'写请求未自动重发，请按原计划回查' if method != 'GET' else '已退避重试仍失败，请稍后再试'}")
+                fail(f"HTTP {error.code} {path}；请检查登录状态或接口是否变化")
+            except urllib.error.URLError as error:
+                fail(f"网络请求失败: {error.reason}")
         if isinstance(payload, dict):
             message = str(payload.get("message", "")).lower()
             login_message = any(word in message for word in (

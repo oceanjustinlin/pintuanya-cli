@@ -2,7 +2,17 @@
 from copy import deepcopy
 import json
 from pathlib import Path
+import time
 from urllib.parse import urlsplit
+
+
+IDENTITY_TTL = 30 * 60  # 计划查重后这段时间内执行，不再重复全量扫描
+
+
+def identity_fresh(op, now=None):
+    checked = op.get('identity_checked_at')
+    now = time.time() if now is None else now
+    return isinstance(checked, (int, float)) and 0 <= now - checked < IDENTITY_TTL
 
 
 def create_body(group, spec):
@@ -68,17 +78,24 @@ def execute(client, group, op, state, save):
         return append_variants.execute(client, group, op, state, save)
     if action == 'create':
         body = op['body']
-        items = client.category_goods(group, body['category_uuid'])
+        resuming = state.get('status') in ('sending','done')
+        recheck = op.get('identity_check') and not resuming and not identity_fresh(op)
+        if recheck:
+            # One whole-group snapshot serves both the same-title and the same-work check.
+            from listing_identity import catalog_goods
+            items = catalog_goods(client, group)
+        else:
+            items = client.category_goods(group, body['category_uuid'])
         same = [g for g in items if g['title'] == body['title']]
-        if state.get('status') in ('sending','done'):
+        if resuming:
             if len(same) != 1 or not matches(same[0], body):
                 raise ValueError('创建结果不确定或已变化；停止且不重复创建，请人工核对')
             state.update(status='done', goods_uuid=same[0]['goods_uuid']); save(); return
         if same:
             raise ValueError('同名商品已存在；核对原规格并追加规格，相同规格不重复添加，停止创建')
-        if op.get('identity_check'):
-            from listing_identity import catalog_goods, reject_existing_work
-            reject_existing_work(body['title'], catalog_goods(client, group))
+        if recheck:
+            from listing_identity import reject_existing_work
+            reject_existing_work(body['title'], items)
         state['status'] = 'sending'; save()
         client.request('POST', '/groupon/goods', body=body)
         items = client.category_goods(group, body['category_uuid'])
@@ -157,7 +174,8 @@ def prepare(client, group, specs):
             if existing is None:
                 existing = catalog_goods(client, group)
             reject_existing_work(body['title'], existing)
-            operations.append({'action':action,'body':body,'identity_check':True})
+            operations.append({'action':action,'body':body,'identity_check':True,
+                               'identity_checked_at':int(time.time())})
         elif action in ('category','sort','append-variants'):
             required = ('goods_uuid', 'source_category_uuid')
             if action != 'append-variants':

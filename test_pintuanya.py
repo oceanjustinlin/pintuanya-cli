@@ -528,6 +528,34 @@ class CliTest(unittest.TestCase):
                     with patch.object(app, "api_urlopen", side_effect=error), patch.dict(app.os.environ, {"PINTUANYA_COOKIE": "test"}), patch("sys.stderr", io.StringIO()):
                         self.assertEqual(app.cli(command), 2)
 
+    def rate_limited(self, retry_after=None):
+        headers = {"Retry-After": retry_after} if retry_after is not None else {}
+        return app.urllib.error.HTTPError("https://example.invalid", 429, "busy", headers, None)
+
+    def test_rate_limited_get_backs_off_and_retries_same_request(self):
+        ok = io.BytesIO(json.dumps({"success": True, "data": {"list": [], "total": 0}}).encode())
+        with patch.object(app, "api_urlopen", side_effect=[self.rate_limited("7"), self.rate_limited(), ok]) as opened, \
+                patch.object(app.time, "sleep") as sleep, patch("sys.stderr", io.StringIO()):
+            result = app.Client("test").request("GET", "/groupon/goods/batch", params={"page": 1})
+        self.assertTrue(result["success"])
+        self.assertEqual(opened.call_count, 3)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [7, 20])
+
+    def test_rate_limited_get_gives_up_after_retry_limit(self):
+        with patch.object(app, "api_urlopen", side_effect=self.rate_limited()) as opened, \
+                patch.object(app.time, "sleep"), patch("sys.stderr", io.StringIO()):
+            with self.assertRaisesRegex(ValueError, "重试仍失败"):
+                app.Client("test").request("GET", "/groupon/goods/batch")
+        self.assertEqual(opened.call_count, app.RATE_LIMIT_RETRIES + 1)
+
+    def test_rate_limited_write_is_never_resent(self):
+        with patch.object(app, "api_urlopen", side_effect=self.rate_limited("1")) as opened, \
+                patch.object(app.time, "sleep") as sleep, patch("sys.stderr", io.StringIO()):
+            with self.assertRaisesRegex(ValueError, "未自动重发"):
+                app.Client("test").request("POST", "/groupon/goods", body={"title": "x"})
+        self.assertEqual(opened.call_count, 1)
+        sleep.assert_not_called()
+
     def test_business_login_failures_have_exit_code_two(self):
         for payload in ({"success": False, "message": "请先登录"},
                         {"code": 401, "message": "请先登录"},

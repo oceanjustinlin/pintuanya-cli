@@ -142,6 +142,30 @@ class ListingWorkflowTest(unittest.TestCase):
             }, {}, Mock())
         client.request.assert_not_called()
 
+    def test_fresh_plan_skips_whole_group_rescan_at_apply(self):
+        client = Mock()
+        client.categories.return_value = [{'category_uuid': 'new'}]
+        client.category_goods.return_value = []
+        op = catalog.prepare(client, 'group', [self.spec()])[0]
+        self.assertTrue(catalog.identity_fresh(op))
+        client.category_goods.reset_mock()
+        client.request.side_effect = AssertionError('stop before verification')
+        with self.assertRaises(AssertionError):
+            catalog.execute(client, 'group', op, {}, Mock())
+        self.assertEqual([c.args[1] for c in client.category_goods.call_args_list], ['new'])
+
+    def test_stale_plan_rescans_once_and_reuses_snapshot_for_same_title(self):
+        body = catalog.create_body('group', self.spec())
+        op = {'action': 'create', 'body': body, 'identity_check': True,
+              'identity_checked_at': int(catalog.time.time()) - catalog.IDENTITY_TTL - 1}
+        self.assertFalse(catalog.identity_fresh(op))
+        client = Mock()
+        client.category_goods.return_value = [{'goods_uuid': 'x', 'title': body['title']}]
+        with self.assertRaisesRegex(ValueError, '同名商品已存在'):
+            catalog.execute(client, 'group', op, {}, Mock())
+        self.assertEqual([c.args[1] for c in client.category_goods.call_args_list], [''])
+        client.request.assert_not_called()
+
     def test_missing_new_uuid_prevents_plan_without_writes(self):
         client = Mock()
         client.categories.return_value = [{'category_uuid': 'other'}]
